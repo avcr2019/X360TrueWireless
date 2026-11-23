@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use nusb::transfer::{Buffer, In, Interrupt, Out};
 use nusb::MaybeFuture;
 use std::f32::consts::PI;
@@ -24,8 +24,8 @@ mod btn {
     pub const BACK: u16 = 0x0020;
     pub const LS: u16 = 0x0040;
     pub const RS: u16 = 0x0080;
-    pub const LB: u16 = 0x0100; // الشيفتر الشمال
-    pub const RB: u16 = 0x0200; // الشيفتر اليمين
+    pub const LB: u16 = 0x0100;
+    pub const RB: u16 = 0x0200;
     pub const GUIDE: u16 = 0x0400;
     pub const A: u16 = 0x1000;
     pub const B: u16 = 0x2000;
@@ -63,7 +63,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Xbox 360 Wireless Wheel - Dashboard Studio")
-            .with_inner_size([780.0, 680.0])
+            .with_inner_size([780.0, 640.0])
             .with_resizable(false),
         ..Default::default()
     };
@@ -100,141 +100,139 @@ impl DashboardApp {
 }
 
 impl eframe::App for DashboardApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint();
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        ui.ctx().request_repaint();
+
+        // خلفية داكنة
+        ui.painter().rect_filled(ui.max_rect(), CornerRadius::ZERO, Color32::from_rgb(18, 20, 26));
 
         let current = self.state.lock().unwrap().clone();
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(Color32::from_rgb(18, 20, 26)))
-            .show(ctx, |ui| {
-                ui.add_space(10.0);
+        ui.add_space(10.0);
 
-                // الشريط العلوي
-                ui.horizontal(|ui| {
-                    ui.heading(
-                        egui::RichText::new("🏎️ XBOX 360 RACING WHEEL STUDIO")
-                            .color(Color32::WHITE)
+        // الشريط العلوي
+        ui.horizontal(|ui| {
+            ui.heading(
+                egui::RichText::new("🏎️ XBOX 360 RACING WHEEL STUDIO")
+                    .color(Color32::WHITE)
+                    .strong(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (txt, color) = if current.connected {
+                    ("● CONNECTED (ONLINE)", Color32::from_rgb(0, 230, 118))
+                } else {
+                    ("○ SEARCHING DONGLE...", Color32::from_rgb(255, 171, 0))
+                };
+                ui.label(egui::RichText::new(txt).color(color).strong());
+            });
+        });
+
+        ui.separator();
+        ui.add_space(8.0);
+
+        // منطقة العرض الرئيسية
+        ui.horizontal(|ui| {
+            // الدريكسون والأزرار
+            ui.vertical(|ui| {
+                ui.set_width(480.0);
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(470.0, 340.0), egui::Sense::hover());
+                draw_wheel_and_controls(ui.painter(), rect, current.steering, current.buttons);
+
+                let angle_deg = (current.steering as f32 / 32768.0) * 135.0;
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Steering Angle: {:+5.1}°", angle_deg))
+                            .color(Color32::from_rgb(0, 229, 255))
+                            .size(18.0)
+                            .monospace()
                             .strong(),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (txt, color) = if current.connected {
-                            ("● CONNECTED (ONLINE)", Color32::from_rgb(0, 230, 118))
-                        } else {
-                            ("○ SEARCHING DONGLE...", Color32::from_rgb(255, 171, 0))
-                        };
-                        ui.label(egui::RichText::new(txt).color(color).strong());
-                    });
-                });
-
-                ui.separator();
-                ui.add_space(8.0);
-
-                // منطقة العرض الرئيسية
-                ui.horizontal(|ui| {
-                    // الدريكسون والأزرار
-                    ui.vertical(|ui| {
-                        ui.set_width(480.0);
-                        let (rect, _) = ui.allocate_exact_size(Vec2::new(470.0, 360.0), egui::Sense::hover());
-                        draw_wheel_and_controls(ui.painter(), rect, current.steering, current.buttons);
-
-                        let angle_deg = (current.steering as f32 / 32768.0) * 135.0;
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Steering Angle: {:+5.1}°", angle_deg))
-                                    .color(Color32::from_rgb(0, 229, 255))
-                                    .size(18.0)
-                                    .monospace()
-                                    .strong(),
-                            );
-                        });
-                    });
-
-                    ui.add_space(15.0);
-
-                    // الدواسات (الفرامل والبنزين)
-                    ui.vertical(|ui| {
-                        ui.set_width(240.0);
-                        ui.label(egui::RichText::new("PEDALS TELEMETRY").color(Color32::GRAY).size(13.0));
-                        ui.add_space(10.0);
-
-                        ui.horizontal(|ui| {
-                            let brake_pct = current.brake as f32 / 255.0;
-                            draw_pedal(ui, "BRAKE", brake_pct, Color32::from_rgb(255, 59, 48));
-
-                            ui.add_space(30.0);
-
-                            let throttle_pct = current.throttle as f32 / 255.0;
-                            draw_pedal(ui, "THROTTLE", throttle_pct, Color32::from_rgb(52, 199, 89));
-                        });
-                    });
-                });
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                // لوحة تحكم الـ Force Feedback
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("⚡ REAL-TIME FORCE FEEDBACK CONTROL").color(Color32::WHITE).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let motor_label = if self.motor_on { "MOTOR: ENABLED" } else { "MOTOR: DISABLED" };
-                            let motor_color = if self.motor_on { Color32::from_rgb(0, 230, 118) } else { Color32::GRAY };
-                            if ui.button(egui::RichText::new(motor_label).color(motor_color).strong()).clicked() {
-                                self.motor_on = !self.motor_on;
-                                let _ = self.tx.send(FfbCommand::MotorPower(self.motor_on));
-                            }
-                        });
-                    });
-
-                    ui.add_space(6.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Autocenter Return Strength:");
-                        if ui.add(egui::Slider::new(&mut self.autocenter_val, 0..=31).text("Steps")).changed() {
-                            let _ = self.tx.send(FfbCommand::Autocenter(self.autocenter_val));
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Test Push Force (Motor):");
-                        let slider = ui.add(egui::Slider::new(&mut self.test_force, -100.0..=100.0).text("% Force"));
-                        if slider.changed() {
-                            let force_byte = (self.test_force * 1.27) as i8;
-                            let _ = self.tx.send(FfbCommand::ConstantForce(force_byte));
-                        }
-                        if ui.button("Center / Stop").clicked() {
-                            self.test_force = 0.0;
-                            let _ = self.tx.send(FfbCommand::ConstantForce(0));
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Rumble Motors:");
-                        if ui.add(egui::Slider::new(&mut self.rumble_strong, 0..=255).text("Heavy")).changed()
-                            || ui.add(egui::Slider::new(&mut self.rumble_weak, 0..=255).text("Light")).changed() {
-                            let _ = self.tx.send(FfbCommand::Rumble(self.rumble_strong, self.rumble_weak));
-                        }
-                        if ui.button("Stop Rumble").clicked() {
-                            self.rumble_strong = 0;
-                            self.rumble_weak = 0;
-                            let _ = self.tx.send(FfbCommand::Rumble(0, 0));
-                        }
-                    });
                 });
             });
+
+            ui.add_space(15.0);
+
+            // الدواسات
+            ui.vertical(|ui| {
+                ui.set_width(240.0);
+                ui.label(egui::RichText::new("PEDALS TELEMETRY").color(Color32::GRAY).size(13.0));
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    let brake_pct = current.brake as f32 / 255.0;
+                    draw_pedal(ui, "BRAKE", brake_pct, Color32::from_rgb(255, 59, 48));
+
+                    ui.add_space(30.0);
+
+                    let throttle_pct = current.throttle as f32 / 255.0;
+                    draw_pedal(ui, "THROTTLE", throttle_pct, Color32::from_rgb(52, 199, 89));
+                });
+            });
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // لوحة تحكم الـ Force Feedback
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("⚡ REAL-TIME FORCE FEEDBACK CONTROL").color(Color32::WHITE).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let motor_label = if self.motor_on { "MOTOR: ENABLED" } else { "MOTOR: DISABLED" };
+                    let motor_color = if self.motor_on { Color32::from_rgb(0, 230, 118) } else { Color32::GRAY };
+                    if ui.button(egui::RichText::new(motor_label).color(motor_color).strong()).clicked() {
+                        self.motor_on = !self.motor_on;
+                        let _ = self.tx.send(FfbCommand::MotorPower(self.motor_on));
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Autocenter Return Strength:");
+                if ui.add(egui::Slider::new(&mut self.autocenter_val, 0..=31).text("Steps")).changed() {
+                    let _ = self.tx.send(FfbCommand::Autocenter(self.autocenter_val));
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Test Push Force (Motor):");
+                let slider = ui.add(egui::Slider::new(&mut self.test_force, -100.0..=100.0).text("% Force"));
+                if slider.changed() {
+                    let force_byte = (self.test_force * 1.27) as i8;
+                    let _ = self.tx.send(FfbCommand::ConstantForce(force_byte));
+                }
+                if ui.button("Center / Stop").clicked() {
+                    self.test_force = 0.0;
+                    let _ = self.tx.send(FfbCommand::ConstantForce(0));
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Rumble Motors:");
+                if ui.add(egui::Slider::new(&mut self.rumble_strong, 0..=255).text("Heavy")).changed()
+                    || ui.add(egui::Slider::new(&mut self.rumble_weak, 0..=255).text("Light")).changed() {
+                    let _ = self.tx.send(FfbCommand::Rumble(self.rumble_strong, self.rumble_weak));
+                }
+                if ui.button("Stop Rumble").clicked() {
+                    self.rumble_strong = 0;
+                    self.rumble_weak = 0;
+                    let _ = self.tx.send(FfbCommand::Rumble(0, 0));
+                }
+            });
+        });
     }
 }
 
-// رسم الدريكسون، الشيفترات، وأزرار التحكم
 fn draw_wheel_and_controls(painter: &egui::Painter, rect: Rect, steering: i16, buttons: u16) {
     let center = rect.center() + Vec2::new(0.0, -10.0);
     let radius = 100.0;
     let angle = (steering as f32 / 32768.0) * (135.0 * PI / 180.0);
 
-    // 1. بدالات السرعة خلف الدركسون (Paddles LB / RB)
+    // البدالات (Paddles LB / RB)
     let left_paddle_color = if buttons & btn::LB != 0 { Color32::from_rgb(0, 229, 255) } else { Color32::from_rgb(45, 50, 60) };
     let right_paddle_color = if buttons & btn::RB != 0 { Color32::from_rgb(0, 229, 255) } else { Color32::from_rgb(45, 50, 60) };
 
@@ -252,7 +250,7 @@ fn draw_wheel_and_controls(painter: &egui::Painter, rect: Rect, steering: i16, b
     );
     painter.text(center + Vec2::new(152.0, 0.0), egui::Align2::CENTER_CENTER, "RB", egui::FontId::proportional(12.0), Color32::WHITE);
 
-    // 2. حلقة الدركسون الخارجية
+    // حلقة الدريكسون الخارجية
     painter.circle_stroke(center, radius, Stroke::new(18.0, Color32::from_rgb(32, 35, 42)));
     painter.circle_stroke(center, radius - 9.0, Stroke::new(2.0, Color32::from_rgb(60, 65, 75)));
 
@@ -268,20 +266,20 @@ fn draw_wheel_and_controls(painter: &egui::Painter, rect: Rect, steering: i16, b
         painter.line_segment([center, spoke_end], Stroke::new(12.0, Color32::from_rgb(50, 55, 65)));
     }
 
-    // مركز الدركسون
+    // مركز الدركسون وزر الـ Guide
     painter.circle_filled(center, 44.0, Color32::from_rgb(25, 28, 34));
     let guide_color = if buttons & btn::GUIDE != 0 { Color32::from_rgb(0, 230, 118) } else { Color32::from_rgb(50, 55, 65) };
     painter.circle_filled(center, 18.0, guide_color);
     painter.text(center, egui::Align2::CENTER_CENTER, "X", egui::FontId::proportional(16.0), Color32::WHITE);
 
-    // 3. أزرار الـ Diamond (A, B, X, Y)
+    // أزرار A, B, X, Y
     let btn_center = center + Vec2::new(65.0, 0.0);
     draw_button(painter, btn_center + Vec2::new(0.0, 20.0), "A", buttons & btn::A != 0, Color32::from_rgb(0, 200, 83));
     draw_button(painter, btn_center + Vec2::new(20.0, 0.0), "B", buttons & btn::B != 0, Color32::from_rgb(244, 67, 54));
     draw_button(painter, btn_center + Vec2::new(-20.0, 0.0), "X", buttons & btn::X != 0, Color32::from_rgb(33, 150, 243));
     draw_button(painter, btn_center + Vec2::new(0.0, -20.0), "Y", buttons & btn::Y != 0, Color32::from_rgb(255, 235, 59));
 
-    // 4. الصليب D-Pad
+    // الصليب D-Pad
     let dpad_center = center + Vec2::new(-65.0, 0.0);
     draw_dpad_arrow(painter, dpad_center + Vec2::new(0.0, -18.0), "▲", buttons & btn::DPAD_UP != 0);
     draw_dpad_arrow(painter, dpad_center + Vec2::new(0.0, 18.0), "▼", buttons & btn::DPAD_DOWN != 0);
@@ -309,14 +307,17 @@ fn draw_dpad_arrow(painter: &egui::Painter, pos: Pos2, text: &str, active: bool)
 
 fn draw_pedal(ui: &mut egui::Ui, name: &str, pct: f32, color: Color32) {
     ui.vertical_centered(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(55.0, 250.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(55.0, 240.0), egui::Sense::hover());
         let painter = ui.painter();
 
-        // الخلفية
-        painter.rect_filled(rect, CornerRadius::same(8), Color32::from_rgb(28, 32, 40));
-        painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, Color32::from_rgb(50, 55, 65)));
+        painter.rect(
+            rect,
+            CornerRadius::same(8),
+            Color32::from_rgb(28, 32, 40),
+            Stroke::new(1.0, Color32::from_rgb(50, 55, 65)),
+            StrokeKind::Inside,
+        );
 
-        // عمود الضغط الحي
         let fill_height = rect.height() * pct.clamp(0.0, 1.0);
         let fill_rect = Rect::from_min_max(
             Pos2::new(rect.left(), rect.bottom() - fill_height),
@@ -330,7 +331,6 @@ fn draw_pedal(ui: &mut egui::Ui, name: &str, pct: f32, color: Color32) {
     });
 }
 
-// محرك اتصال الـ USB في الخلفية
 fn usb_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbCommand>) {
     loop {
         let Ok(devices) = nusb::list_devices().wait() else {
