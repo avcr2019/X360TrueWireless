@@ -33,12 +33,68 @@ mod btn {
     pub const Y: u16 = 0x8000;
 }
 
+#[derive(Clone, Copy)]
+struct PedalCalib {
+    min: u8,
+    max: u8,
+    initialized: bool,
+}
+
+impl Default for PedalCalib {
+    fn default() -> Self {
+        Self {
+            min: 255,
+            max: 0,
+            initialized: false,
+        }
+    }
+}
+
+impl PedalCalib {
+    fn process(&mut self, raw: u8) -> f32 {
+        if !self.initialized {
+            self.min = raw;
+            self.max = raw.saturating_add(30);
+            self.initialized = true;
+        }
+
+        // تحديث الحد الأدنى إذا ظهرت قراءة أقل في وضع الراحة
+        if raw < self.min {
+            self.min = raw;
+        }
+        // تحديث الحد الأقصى عند الضغط الكامل
+        if raw > self.max {
+            self.max = raw;
+        }
+
+        let range = (self.max.saturating_sub(self.min)) as f32;
+        if range < 5.0 {
+            return 0.0;
+        }
+
+        let val = (raw.saturating_sub(self.min)) as f32 / range;
+        
+        // Deadzone بنسبة 4% لمنع الارتعاش عند وضع الراحة
+        if val < 0.04 {
+            0.0
+        } else {
+            ((val - 0.04) / 0.96).clamp(0.0, 1.0)
+        }
+    }
+
+    fn reset(&mut self) {
+        self.initialized = false;
+        self.min = 255;
+        self.max = 0;
+    }
+}
+
 #[derive(Default, Clone)]
 struct WheelState {
     connected: bool,
     steering: i16,
-    brake: u8,
-    throttle: u8,
+    brake_raw: u8,
+    throttle_raw: u8,
     buttons: u16,
 }
 
@@ -63,7 +119,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Xbox 360 Wireless Wheel - Dashboard Studio")
-            .with_inner_size([780.0, 640.0])
+            .with_inner_size([780.0, 660.0])
             .with_resizable(false),
         ..Default::default()
     };
@@ -83,6 +139,8 @@ struct DashboardApp {
     test_force: f32,
     rumble_strong: u8,
     rumble_weak: u8,
+    brake_calib: PedalCalib,
+    throttle_calib: PedalCalib,
 }
 
 impl DashboardApp {
@@ -95,6 +153,8 @@ impl DashboardApp {
             test_force: 0.0,
             rumble_strong: 0,
             rumble_weak: 0,
+            brake_calib: PedalCalib::default(),
+            throttle_calib: PedalCalib::default(),
         }
     }
 }
@@ -103,10 +163,13 @@ impl eframe::App for DashboardApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint();
 
-        // خلفية داكنة
         ui.painter().rect_filled(ui.max_rect(), CornerRadius::ZERO, Color32::from_rgb(18, 20, 26));
 
         let current = self.state.lock().unwrap().clone();
+
+        // حساب نسب البنزين والفرامل بعد المعايرة الذكية
+        let brake_pct = self.brake_calib.process(current.brake_raw);
+        let throttle_pct = self.throttle_calib.process(current.throttle_raw);
 
         ui.add_space(10.0);
 
@@ -152,19 +215,21 @@ impl eframe::App for DashboardApp {
 
             ui.add_space(15.0);
 
-            // الدواسات
+            // الدواسات (معايرة تلقائية)
             ui.vertical(|ui| {
                 ui.set_width(240.0);
-                ui.label(egui::RichText::new("PEDALS TELEMETRY").color(Color32::GRAY).size(13.0));
-                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("PEDALS").color(Color32::GRAY).size(13.0));
+                    if ui.button(egui::RichText::new("↺ Reset Calib").size(10.0)).on_hover_text("اضغط لإعادة ضبط نقطة الصفر وأنت سايب الدواسات").clicked() {
+                        self.brake_calib.reset();
+                        self.throttle_calib.reset();
+                    }
+                });
+                ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    let brake_pct = current.brake as f32 / 255.0;
                     draw_pedal(ui, "BRAKE", brake_pct, Color32::from_rgb(255, 59, 48));
-
                     ui.add_space(30.0);
-
-                    let throttle_pct = current.throttle as f32 / 255.0;
                     draw_pedal(ui, "THROTTLE", throttle_pct, Color32::from_rgb(52, 199, 89));
                 });
             });
@@ -174,7 +239,7 @@ impl eframe::App for DashboardApp {
         ui.separator();
         ui.add_space(6.0);
 
-        // لوحة تحكم الـ Force Feedback
+        // لوحة الـ Force Feedback
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -232,7 +297,6 @@ fn draw_wheel_and_controls(painter: &egui::Painter, rect: Rect, steering: i16, b
     let radius = 100.0;
     let angle = (steering as f32 / 32768.0) * (135.0 * PI / 180.0);
 
-    // البدالات (Paddles LB / RB)
     let left_paddle_color = if buttons & btn::LB != 0 { Color32::from_rgb(0, 229, 255) } else { Color32::from_rgb(45, 50, 60) };
     let right_paddle_color = if buttons & btn::RB != 0 { Color32::from_rgb(0, 229, 255) } else { Color32::from_rgb(45, 50, 60) };
 
@@ -250,43 +314,36 @@ fn draw_wheel_and_controls(painter: &egui::Painter, rect: Rect, steering: i16, b
     );
     painter.text(center + Vec2::new(152.0, 0.0), egui::Align2::CENTER_CENTER, "RB", egui::FontId::proportional(12.0), Color32::WHITE);
 
-    // حلقة الدريكسون الخارجية
     painter.circle_stroke(center, radius, Stroke::new(18.0, Color32::from_rgb(32, 35, 42)));
     painter.circle_stroke(center, radius - 9.0, Stroke::new(2.0, Color32::from_rgb(60, 65, 75)));
 
-    // خط تحديد المنتصف الأحمر
     let mark_angle = angle - PI / 2.0;
     let mark_pos = center + Vec2::new(mark_angle.cos(), mark_angle.sin()) * radius;
     painter.circle_filled(mark_pos, 7.0, Color32::from_rgb(255, 45, 85));
 
-    // الأذرع الداخلية (Spokes)
     for spoke_offset in [PI, 0.0, PI / 2.0] {
         let a = angle + spoke_offset;
         let spoke_end = center + Vec2::new(a.cos(), a.sin()) * (radius - 12.0);
         painter.line_segment([center, spoke_end], Stroke::new(12.0, Color32::from_rgb(50, 55, 65)));
     }
 
-    // مركز الدركسون وزر الـ Guide
     painter.circle_filled(center, 44.0, Color32::from_rgb(25, 28, 34));
     let guide_color = if buttons & btn::GUIDE != 0 { Color32::from_rgb(0, 230, 118) } else { Color32::from_rgb(50, 55, 65) };
     painter.circle_filled(center, 18.0, guide_color);
     painter.text(center, egui::Align2::CENTER_CENTER, "X", egui::FontId::proportional(16.0), Color32::WHITE);
 
-    // أزرار A, B, X, Y
     let btn_center = center + Vec2::new(65.0, 0.0);
     draw_button(painter, btn_center + Vec2::new(0.0, 20.0), "A", buttons & btn::A != 0, Color32::from_rgb(0, 200, 83));
     draw_button(painter, btn_center + Vec2::new(20.0, 0.0), "B", buttons & btn::B != 0, Color32::from_rgb(244, 67, 54));
     draw_button(painter, btn_center + Vec2::new(-20.0, 0.0), "X", buttons & btn::X != 0, Color32::from_rgb(33, 150, 243));
     draw_button(painter, btn_center + Vec2::new(0.0, -20.0), "Y", buttons & btn::Y != 0, Color32::from_rgb(255, 235, 59));
 
-    // الصليب D-Pad
     let dpad_center = center + Vec2::new(-65.0, 0.0);
     draw_dpad_arrow(painter, dpad_center + Vec2::new(0.0, -18.0), "▲", buttons & btn::DPAD_UP != 0);
     draw_dpad_arrow(painter, dpad_center + Vec2::new(0.0, 18.0), "▼", buttons & btn::DPAD_DOWN != 0);
     draw_dpad_arrow(painter, dpad_center + Vec2::new(-18.0, 0.0), "◀", buttons & btn::DPAD_LEFT != 0);
     draw_dpad_arrow(painter, dpad_center + Vec2::new(18.0, 0.0), "▶", buttons & btn::DPAD_RIGHT != 0);
 
-    // Start / Back
     draw_button(painter, center + Vec2::new(-25.0, 32.0), "<", buttons & btn::BACK != 0, Color32::LIGHT_GRAY);
     draw_button(painter, center + Vec2::new(25.0, 32.0), ">", buttons & btn::START != 0, Color32::LIGHT_GRAY);
 }
@@ -401,8 +458,8 @@ fn usb_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbCommand>) {
                         {
                             let mut s = state.lock().unwrap();
                             s.steering = lx;
-                            s.brake = lt;
-                            s.throttle = rt;
+                            s.brake_raw = lt;
+                            s.throttle_raw = rt;
                             s.buttons = buttons;
                             s.connected = true;
                         }
