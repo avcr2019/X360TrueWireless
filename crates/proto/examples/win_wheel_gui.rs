@@ -5,17 +5,21 @@ use nusb::transfer::{Buffer, In, Interrupt, Out};
 use nusb::MaybeFuture;
 use std::ffi::c_void;
 use std::f32::consts::PI;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const RECEIVER_IDS: &[(u16, u16)] = &[
     (0x045e, 0x0719),
     (0x045e, 0x0291),
     (0x045e, 0x02a9),
 ];
+
+// استقبال أوامر خبطات وصدمات اللعبة في نانو ثانية بدون أي تأخير على الـ USB
+static GAME_FFB_MAGNITUDE: AtomicI32 = AtomicI32::new(0);
+static GAME_FFB_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 mod btn {
     pub const DPAD_UP: u16 = 0x0001;
@@ -35,9 +39,6 @@ mod btn {
     pub const Y: u16 = 0x8000;
 }
 
-// ----------------------------------------------------
-// وحدة vJoy المتكاملة مع الـ Force Feedback Feeder
-// ----------------------------------------------------
 mod vjoy {
     use super::*;
 
@@ -56,7 +57,7 @@ mod vjoy {
     pub struct FfbEffConstant {
         pub effect_block_index: u8,
         pub _pad: [u8; 3],
-        pub magnitude: i32, // من -10000 إلى 10000
+        pub magnitude: i32,
     }
 
     #[repr(C)]
@@ -91,7 +92,6 @@ mod vjoy {
     pub struct FfbContext {
         pub fn_eff_const: FnFfbEffConstant,
         pub fn_eff_op: Option<FnFfbEffOp>,
-        pub tx_ffb: Sender<FfbEvent>,
     }
 
     pub unsafe extern "system" fn ffb_callback(p_packet: *const c_void, p_ctx: *mut c_void) {
@@ -103,14 +103,16 @@ mod vjoy {
         if let Some(f_op) = ctx.fn_eff_op {
             let mut op = FfbEffOp::default();
             if f_op(p_packet, &mut op) == 0 && op.effect_op == 3 {
-                let _ = ctx.tx_ffb.send(FfbEvent::Stop);
+                GAME_FFB_MAGNITUDE.store(0, Ordering::Relaxed);
+                GAME_FFB_ACTIVE.store(false, Ordering::Relaxed);
                 return;
             }
         }
 
         let mut eff_const = FfbEffConstant::default();
         if (ctx.fn_eff_const)(p_packet, &mut eff_const) == 0 {
-            let _ = ctx.tx_ffb.send(FfbEvent::Force(eff_const.magnitude));
+            GAME_FFB_MAGNITUDE.store(eff_const.magnitude, Ordering::Relaxed);
+            GAME_FFB_ACTIVE.store(true, Ordering::Relaxed);
         }
     }
 
@@ -257,12 +259,9 @@ mod vjoy {
     }
 }
 
-pub enum FfbEvent {
-    Force(i32),
-    Stop,
-}
-
-// معايرة الدواسات وعزل نقطة الصفر
+// ----------------------------------------------------
+// نفس نظام المعايرة اللي شغال معاك فابريكا بدون أي تعديل
+// ----------------------------------------------------
 #[derive(Clone, Copy)]
 struct PedalCalib {
     rest_baseline: u8,
@@ -328,7 +327,7 @@ struct WheelState {
     brake_pct: f32,
     throttle_pct: f32,
     buttons: u16,
-    game_ffb_force: f32, // قوة الـ FFB الحية من اللعبة للعرض
+    game_ffb_force: f32,
 }
 
 enum FfbCommand {
@@ -405,7 +404,6 @@ impl eframe::App for DashboardApp {
 
         ui.add_space(10.0);
 
-        // الشريط العلوي
         ui.horizontal(|ui| {
             ui.heading(
                 egui::RichText::new("🏎️ XBOX 360 RACING WHEEL STUDIO")
@@ -490,7 +488,6 @@ impl eframe::App for DashboardApp {
 
             ui.add_space(4.0);
 
-            // شريط إشارة صدمات اللعبة الحية
             ui.horizontal(|ui| {
                 ui.label("Live Game FFB Signal:");
                 draw_ffb_meter(ui, current.game_ffb_force);
@@ -499,7 +496,6 @@ impl eframe::App for DashboardApp {
 
             ui.add_space(4.0);
 
-            // إعدادات قوة الصدمات وعكس الاتجاه
             ui.horizontal(|ui| {
                 ui.label("FFB Gain Multiplier:");
                 if ui.add(egui::Slider::new(&mut self.ffb_gain, 0.0..=2.0).text("Strength")).changed() {
@@ -513,7 +509,6 @@ impl eframe::App for DashboardApp {
 
             ui.separator();
 
-            // اختبارات يدوية
             ui.horizontal(|ui| {
                 ui.label("Autocenter Return:");
                 if ui.add(egui::Slider::new(&mut self.autocenter_val, 0..=31).text("Steps")).changed() {
@@ -662,20 +657,19 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
     let mut brake_calib = PedalCalib::default();
     let mut throttle_calib = PedalCalib::default();
 
-    let (tx_ffb, rx_ffb) = channel::<FfbEvent>();
-
-    // تسجيل دالة الـ FFB Callback مع vJoy
+    // تسجيل استلام الـ FFB بأمان فائق في الذاكرة
     if vjoy_dev.enabled && vjoy_dev.fn_eff_const.is_some() {
         let ctx = Box::new(vjoy::FfbContext {
             fn_eff_const: vjoy_dev.fn_eff_const.unwrap(),
             fn_eff_op: vjoy_dev.fn_eff_op,
-            tx_ffb,
         });
         vjoy_dev.register_ffb(Box::into_raw(ctx));
     }
 
     let mut user_gain: f32 = 1.0;
     let mut user_invert: bool = false;
+    let mut last_sent_ffb: i8 = 0;
+    let mut last_ffb_time = Instant::now();
 
     loop {
         if !vjoy_dev.acquired {
@@ -722,7 +716,6 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
             }
             state.lock().unwrap().vjoy_connected = vjoy_dev.acquired;
 
-            // أوامر الواجهة اليدوية
             while let Ok(cmd) = rx_cmd.try_recv() {
                 match cmd {
                     FfbCommand::MotorPower(on) => {
@@ -751,26 +744,26 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                 }
             }
 
-            // استقبال أوامر الصدمات الحية من اللعبة (DiRT 2 / Forza) عبر vJoy
-            while let Ok(ffb_event) = rx_ffb.try_recv() {
-                match ffb_event {
-                    FfbEvent::Force(mag) => {
-                        // DiRT 2 ترسل القوة من -10000 إلى +10000
-                        let sign = if user_invert { 1.0 } else { -1.0 };
-                        let f_norm = (mag as f32 / 10000.0) * sign;
-                        let total_f = (f_norm * user_gain).clamp(-1.0, 1.0);
-                        let force_byte = (total_f * 127.0) as i8;
+            // إرسال قوة خبطات اللعبة للموتور بدون أي تعطيل لحركة الدواسات
+            if GAME_FFB_ACTIVE.load(Ordering::Relaxed) {
+                let raw_mag = GAME_FFB_MAGNITUDE.load(Ordering::Relaxed);
+                let sign = if user_invert { 1.0 } else { -1.0 };
+                let f_norm = (raw_mag as f32 / 10000.0) * sign;
+                let total_f = (f_norm * user_gain).clamp(-1.0, 1.0);
+                let force_byte = (total_f * 127.0) as i8;
 
-                        // تحديث القوة الحية فوراً على موتور الدريكسون عبر الـ USB
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, force_byte as u8, 0, 0, 0, 0, 0]);
+                state.lock().unwrap().game_ffb_force = f_norm;
 
-                        state.lock().unwrap().game_ffb_force = f_norm;
-                    }
-                    FfbEvent::Stop => {
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
-                        state.lock().unwrap().game_ffb_force = 0.0;
-                    }
+                // تحديث الـ USB فقط عند تغير القوة وبحد زمني يمنع خنق الـ USB
+                if force_byte != last_sent_ffb && last_ffb_time.elapsed() >= Duration::from_millis(15) {
+                    let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, force_byte as u8, 0, 0, 0, 0, 0]);
+                    last_sent_ffb = force_byte;
+                    last_ffb_time = Instant::now();
                 }
+            } else if last_sent_ffb != 0 {
+                let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
+                last_sent_ffb = 0;
+                state.lock().unwrap().game_ffb_force = 0.0;
             }
 
             if let Some(transfer) = ep_in.wait_next_complete(Duration::from_millis(8)) {
@@ -798,7 +791,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                             s.connected = true;
                         }
 
-                        // تغذية vJoy بالحركة الموحدة
+                        // تغذية vJoy السريعة
                         let vjoy_steering = (((lx as i32 + 32768) as f64 / 65535.0) * 32767.0 + 1.0) as i32;
                         vjoy_dev.set_axis(vjoy::HID_USAGE_X, vjoy_steering.clamp(1, 32768));
 
@@ -834,7 +827,6 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         };
                         vjoy_dev.set_pov(pov);
 
-                        // تهيئة قناة الفيدباك في الدريكسون لأول مرة
                         if !motor_inited {
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
@@ -860,5 +852,5 @@ fn send_pkt(ep: &mut nusb::Endpoint<Interrupt, Out>, packet: &[u8]) -> Result<()
     padded[..len].copy_from_slice(&packet[..len]);
     let mut buf = Buffer::new(12);
     buf.extend_from_slice(&padded);
-    ep.transfer_blocking(buf, Duration::from_millis(200)).status
+    ep.transfer_blocking(buf, Duration::from_millis(50)).status
 }
