@@ -1,0 +1,27 @@
+name: Build Windows Exe
+
+on:
+  push:
+    branches: [ "main", "master", "dev" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows Tools
+        run: |
+          cargo build --release -p x360truewireless-proto
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: x360-windows-tools
+          path: target/release/*.exe
