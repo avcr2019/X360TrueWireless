@@ -15,12 +15,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Windows Test Tool
+      - name: Build Windows Wheel GUI
         run: |
-          cargo build --release --package x360truewireless-proto --example win_test
+          cargo build --release --package x360truewireless-proto --example win_wheel_gui
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: x360-windows-tools
-          path: target/release/examples/win_test.exe
+          name: x360-wheel-dashboard
+          path: target/release/examples/win_wheel_gui.exe
