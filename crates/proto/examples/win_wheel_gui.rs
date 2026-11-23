@@ -31,7 +31,7 @@ fn add_log(text: impl Into<String>, color: Color32) {
     let start = START_TIME.get_or_init(Instant::now);
     let time_s = start.elapsed().as_secs_f32();
     let mut logs = LOG_ENTRIES.lock().unwrap();
-    if logs.len() > 250 {
+    if logs.len() > 300 {
         logs.remove(0);
     }
     logs.push(LogEntry {
@@ -61,6 +61,22 @@ mod btn {
     pub const X: u16 = 0x4000;
     pub const Y: u16 = 0x8000;
 }
+
+const BUTTON_NAMES: &[(u16, &str)] = &[
+    (btn::A, "A"),
+    (btn::B, "B"),
+    (btn::X, "X"),
+    (btn::Y, "Y"),
+    (btn::LB, "Paddle Left (LB)"),
+    (btn::RB, "Paddle Right (RB)"),
+    (btn::DPAD_UP, "D-Pad Up"),
+    (btn::DPAD_DOWN, "D-Pad Down"),
+    (btn::DPAD_LEFT, "D-Pad Left"),
+    (btn::DPAD_RIGHT, "D-Pad Right"),
+    (btn::START, "Start"),
+    (btn::BACK, "Back"),
+    (btn::GUIDE, "Guide"),
+];
 
 mod vjoy {
     use super::*;
@@ -286,9 +302,6 @@ mod vjoy {
     }
 }
 
-// ----------------------------------------------------
-// نظام المعايرة الذكي المضاد للتجميد (Bulletproof Calibrator)
-// ----------------------------------------------------
 #[derive(Clone, Copy)]
 struct PedalCalib {
     pub rest_baseline: u8,
@@ -316,7 +329,7 @@ impl PedalCalib {
             if raw < 135 {
                 self.rest_baseline = raw;
                 self.initialized = true;
-                add_log(format!("Auto-Calibrated Zero to: {}", raw), Color32::YELLOW);
+                add_log(format!("Auto-Calibrated Zero baseline to: {}", raw), Color32::YELLOW);
             } else {
                 self.rest_baseline = 90;
                 self.initialized = true;
@@ -375,6 +388,7 @@ enum FfbCommand {
     ResetPedals,
     Gain(f32),
     Invert(bool),
+    CenterWheel,
 }
 
 fn main() -> eframe::Result<()> {
@@ -391,8 +405,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Xbox 360 Wheel Studio & FFB Feeder - Pro Edition")
-            .with_inner_size([1040.0, 690.0])
-            .with_resizable(false),
+            .with_inner_size([1040.0, 710.0])
+            .with_min_inner_size([750.0, 520.0])
+            .with_resizable(true), // ميزة تكبير وتصغير النافذة
         ..Default::default()
     };
 
@@ -413,6 +428,7 @@ struct DashboardApp {
     rumble_weak: u8,
     ffb_gain: f32,
     invert_ffb: bool,
+    is_testing_sweep: bool,
 }
 
 impl DashboardApp {
@@ -427,6 +443,7 @@ impl DashboardApp {
             rumble_weak: 0,
             ffb_gain: 1.0,
             invert_ffb: false,
+            is_testing_sweep: false,
         }
     }
 }
@@ -439,12 +456,13 @@ impl eframe::App for DashboardApp {
 
         let current = self.state.lock().unwrap().clone();
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
+        // واجهة مقسمة قابلة للتجاوب
         ui.horizontal(|ui| {
-            // الجزء الأيسر: التحكم والدريكسون
+            // الجزء الأيسر: التحكم والقياسات
             ui.vertical(|ui| {
-                ui.set_width(720.0);
+                ui.set_width(710.0);
 
                 ui.horizontal(|ui| {
                     ui.heading(
@@ -454,7 +472,7 @@ impl eframe::App for DashboardApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if current.vjoy_connected {
-                            ui.label(egui::RichText::new("● vJoy: FEEDING").color(Color32::from_rgb(0, 230, 118)).strong());
+                            ui.label(egui::RichText::new("● vJoy: ACTIVE").color(Color32::from_rgb(0, 230, 118)).strong());
                         } else {
                             ui.label(egui::RichText::new("⚠ vJoy: BUSY / OFF").color(Color32::from_rgb(255, 171, 0)).strong());
                         }
@@ -468,34 +486,61 @@ impl eframe::App for DashboardApp {
                 });
 
                 ui.separator();
-                ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
+                    // الدريكسون والأزرار
                     ui.vertical(|ui| {
                         ui.set_width(450.0);
-                        let (rect, _) = ui.allocate_exact_size(Vec2::new(440.0, 330.0), egui::Sense::hover());
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(440.0, 310.0), egui::Sense::hover());
                         draw_wheel_and_controls(ui.painter(), rect, current.steering, current.buttons);
 
                         let angle_deg = (current.steering as f32 / 32768.0) * 135.0;
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("Steering Angle: {:+5.1}°", angle_deg))
+                                egui::RichText::new(format!("Angle: {:+5.1}°", angle_deg))
                                     .color(Color32::from_rgb(0, 229, 255))
-                                    .size(17.0)
+                                    .size(16.0)
                                     .monospace()
                                     .strong(),
                             );
                         });
+
+                        ui.add_space(4.0);
+
+                        // أزرار المعايرة والتوسيط الذاتية الجديدة!
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            if ui.button(egui::RichText::new("🎯 Center Wheel").size(12.0).color(Color32::from_rgb(0, 230, 118))).on_hover_text("سحب الدريكسون للمنتصف فوراً").clicked() {
+                                let _ = self.tx.send(FfbCommand::CenterWheel);
+                            }
+
+                            if ui.add_enabled(!self.is_testing_sweep, egui::Button::new(egui::RichText::new("🔄 Lock-to-Lock Sweep Test").size(12.0).color(Color32::from_rgb(0, 229, 255))))
+                                .on_hover_text("فحص حركة الدريكسون 135 يمين ثم 135 شمال ثم التوسيط").clicked() {
+                                self.is_testing_sweep = true;
+                                let tx_clone = self.tx.clone();
+                                thread::spawn(move || {
+                                    add_log(">>> Starting Lock-to-Lock Sweep Test...", Color32::YELLOW);
+                                    let _ = tx_clone.send(FfbCommand::ConstantForce(65));
+                                    thread::sleep(Duration::from_millis(900));
+                                    let _ = tx_clone.send(FfbCommand::ConstantForce(-65));
+                                    thread::sleep(Duration::from_millis(1600));
+                                    let _ = tx_clone.send(FfbCommand::ConstantForce(0));
+                                    let _ = tx_clone.send(FfbCommand::CenterWheel);
+                                    add_log("<<< Sweep Test Completed! Centered.", Color32::from_rgb(0, 230, 118));
+                                });
+                                self.is_testing_sweep = false;
+                            }
+                        });
                     });
 
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
 
                     // الدواسات
                     ui.vertical(|ui| {
                         ui.set_width(240.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("PEDALS").color(Color32::GRAY).size(13.0));
-                            if ui.button(egui::RichText::new("↺ Reset Zero").size(11.0)).on_hover_text("اضغط وأنت سايب الدواسات تماماً").clicked() {
+                            if ui.button(egui::RichText::new("↺ Reset Zero").size(11.0)).on_hover_text("اضغط لتثبيت الصفر وأنت سايب الدواسات تماماً").clicked() {
                                 let _ = self.tx.send(FfbCommand::ResetPedals);
                             }
                         });
@@ -512,7 +557,7 @@ impl eframe::App for DashboardApp {
                 ui.add_space(6.0);
                 ui.separator();
 
-                // لوحة التحكم والـ FFB
+                // لوحة صدمات اللعبة والـ FFB
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -530,7 +575,7 @@ impl eframe::App for DashboardApp {
                     ui.add_space(4.0);
 
                     ui.horizontal(|ui| {
-                        ui.label("Game Force Signal:");
+                        ui.label("Live Game FFB Signal:");
                         draw_ffb_meter(ui, current.game_ffb_force);
                         ui.label(format!("{:+4.0}%", current.game_ffb_force * 100.0));
                     });
@@ -570,9 +615,9 @@ impl eframe::App for DashboardApp {
 
             ui.add_space(8.0);
 
-            // الجزء الأيمن: شاشة الـ Log
+            // الجزء الأيمن: شاشة الـ Live Log الشاملة
             ui.vertical(|ui| {
-                ui.set_width(290.0);
+                ui.set_width(ui.available_width().max(280.0));
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("📜 LIVE DIAGNOSTIC LOG").color(Color32::WHITE).strong());
@@ -589,7 +634,8 @@ impl eframe::App for DashboardApp {
 
                 ui.separator();
 
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(290.0, 620.0), egui::Sense::hover());
+                let avail_h = ui.available_height() - 10.0;
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), avail_h), egui::Sense::hover());
                 ui.painter().rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(12, 14, 18));
                 ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, Color32::from_rgb(40, 44, 52)), StrokeKind::Inside);
 
@@ -753,6 +799,11 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
     let mut last_sent_ffb: i8 = 0;
     let mut last_ffb_time = Instant::now();
 
+    let mut last_buttons: u16 = 0;
+    let mut last_throttle_active = false;
+    let mut last_brake_active = false;
+    let mut last_angle_quadrant: i8 = 0;
+
     loop {
         if !vjoy_dev.acquired {
             vjoy_dev.try_acquire();
@@ -831,6 +882,13 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         user_invert = inv;
                         add_log(format!("FFB Invert: {}", inv), Color32::YELLOW);
                     }
+                    FfbCommand::CenterWheel => {
+                        // إرسال أمر التوسيط الفوري للدريكسون
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]);
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
+                        add_log("Wheel Centered by Autocenter motor", Color32::from_rgb(0, 230, 118));
+                    }
                 }
             }
 
@@ -871,6 +929,52 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
 
                         let b_pct = brake_calib.process(lt, true);
                         let t_pct = throttle_calib.process(rt, true);
+
+                        // ----------------------------------------------------
+                        // تسجيل كل ضغطة زرار ودواسة بالاسم في الـ Log!
+                        // ----------------------------------------------------
+                        if buttons != last_buttons {
+                            for &(bit, name) in BUTTON_NAMES {
+                                if (buttons & bit != 0) && (last_buttons & bit == 0) {
+                                    add_log(format!("Button [{}] PRESSED", name), Color32::from_rgb(0, 230, 118));
+                                } else if (buttons & bit == 0) && (last_buttons & bit != 0) {
+                                    add_log(format!("Button [{}] RELEASED", name), Color32::GRAY);
+                                }
+                            }
+                            last_buttons = buttons;
+                        }
+
+                        // تسجيل البنزين
+                        let t_active = t_pct > 0.03;
+                        if t_active && !last_throttle_active {
+                            add_log(format!("Throttle Pressed: {:.0}%", t_pct * 100.0), Color32::from_rgb(52, 199, 89));
+                            last_throttle_active = true;
+                        } else if !t_active && last_throttle_active {
+                            add_log("Throttle Released (0%)", Color32::GRAY);
+                            last_throttle_active = false;
+                        }
+
+                        // تسجيل الفرامل
+                        let b_active = b_pct > 0.03;
+                        if b_active && !last_brake_active {
+                            add_log(format!("Brake Pressed: {:.0}%", b_pct * 100.0), Color32::from_rgb(255, 59, 48));
+                            last_brake_active = true;
+                        } else if !b_active && last_brake_active {
+                            add_log("Brake Released (0%)", Color32::GRAY);
+                            last_brake_active = false;
+                        }
+
+                        // تسجيل زوايا الدريكسون المهمة (المنتصف / أقصى اليمين / أقصى الشمال)
+                        let quad = if lx > 24000 { 2 } else if lx > 8000 { 1 } else if lx < -24000 { -2 } else if lx < -8000 { -1 } else { 0 };
+                        if quad != last_angle_quadrant {
+                            match quad {
+                                2 => add_log("Steering: Right Full Lock (135°)", Color32::from_rgb(0, 229, 255)),
+                                -2 => add_log("Steering: Left Full Lock (-135°)", Color32::from_rgb(0, 229, 255)),
+                                0 if last_angle_quadrant.abs() >= 1 => add_log("Steering: Returned to Center", Color32::GRAY),
+                                _ => {}
+                            }
+                            last_angle_quadrant = quad;
+                        }
 
                         {
                             let mut s = state.lock().unwrap();
