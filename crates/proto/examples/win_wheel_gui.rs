@@ -337,7 +337,7 @@ impl PedalCalib {
             }
         }
 
-        let threshold = self.rest_baseline.saturating_add(14);
+        let threshold = self.rest_baseline.saturating_add(16);
         if raw <= threshold {
             return 0.0;
         }
@@ -389,6 +389,9 @@ enum FfbCommand {
     Gain(f32),
     Invert(bool),
     CenterWheel,
+    SweepRight,
+    SweepLeft,
+    SweepEnd,
 }
 
 fn main() -> eframe::Result<()> {
@@ -407,7 +410,7 @@ fn main() -> eframe::Result<()> {
             .with_title("Xbox 360 Wheel Studio & FFB Feeder - Pro Edition")
             .with_inner_size([1040.0, 710.0])
             .with_min_inner_size([750.0, 520.0])
-            .with_resizable(true), // ميزة تكبير وتصغير النافذة
+            .with_resizable(true),
         ..Default::default()
     };
 
@@ -458,9 +461,8 @@ impl eframe::App for DashboardApp {
 
         ui.add_space(6.0);
 
-        // واجهة مقسمة قابلة للتجاوب
         ui.horizontal(|ui| {
-            // الجزء الأيسر: التحكم والقياسات
+            // الجزء الأيسر
             ui.vertical(|ui| {
                 ui.set_width(710.0);
 
@@ -488,7 +490,6 @@ impl eframe::App for DashboardApp {
                 ui.separator();
 
                 ui.horizontal(|ui| {
-                    // الدريكسون والأزرار
                     ui.vertical(|ui| {
                         ui.set_width(450.0);
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(440.0, 310.0), egui::Sense::hover());
@@ -507,7 +508,7 @@ impl eframe::App for DashboardApp {
 
                         ui.add_space(4.0);
 
-                        // أزرار المعايرة والتوسيط الذاتية الجديدة!
+                        // أزرار المعايرة والتوسيط بعد تفعيل الحركة الفيزيائية
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
                             if ui.button(egui::RichText::new("🎯 Center Wheel").size(12.0).color(Color32::from_rgb(0, 230, 118))).on_hover_text("سحب الدريكسون للمنتصف فوراً").clicked() {
@@ -520,12 +521,11 @@ impl eframe::App for DashboardApp {
                                 let tx_clone = self.tx.clone();
                                 thread::spawn(move || {
                                     add_log(">>> Starting Lock-to-Lock Sweep Test...", Color32::YELLOW);
-                                    let _ = tx_clone.send(FfbCommand::ConstantForce(65));
+                                    let _ = tx_clone.send(FfbCommand::SweepRight);
                                     thread::sleep(Duration::from_millis(900));
-                                    let _ = tx_clone.send(FfbCommand::ConstantForce(-65));
+                                    let _ = tx_clone.send(FfbCommand::SweepLeft);
                                     thread::sleep(Duration::from_millis(1600));
-                                    let _ = tx_clone.send(FfbCommand::ConstantForce(0));
-                                    let _ = tx_clone.send(FfbCommand::CenterWheel);
+                                    let _ = tx_clone.send(FfbCommand::SweepEnd);
                                     add_log("<<< Sweep Test Completed! Centered.", Color32::from_rgb(0, 230, 118));
                                 });
                                 self.is_testing_sweep = false;
@@ -615,7 +615,7 @@ impl eframe::App for DashboardApp {
 
             ui.add_space(8.0);
 
-            // الجزء الأيمن: شاشة الـ Live Log الشاملة
+            // الجزء الأيمن: الـ Log
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width().max(280.0));
 
@@ -798,6 +798,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
     let mut user_invert: bool = false;
     let mut last_sent_ffb: i8 = 0;
     let mut last_ffb_time = Instant::now();
+    let mut sweep_active = false;
 
     let mut last_buttons: u16 = 0;
     let mut last_throttle_active = false;
@@ -882,18 +883,38 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         user_invert = inv;
                         add_log(format!("FFB Invert: {}", inv), Color32::YELLOW);
                     }
+                    // توسيط الدريكسون فوراً
                     FfbCommand::CenterWheel => {
-                        // إرسال أمر التوسيط الفوري للدريكسون
+                        sweep_active = false;
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]);
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]); // motor on
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]); // start autocenter
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]); // full strength
                         add_log("Wheel Centered by Autocenter motor", Color32::from_rgb(0, 230, 118));
+                    }
+                    // الفحص الشامل لليمين
+                    FfbCommand::SweepRight => {
+                        sweep_active = true;
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x10]); // إيقاف السبرنج مؤقتاً لإطلاق عزم الموتور
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x58, 0, 0, 0, 0, 0]); // لف يمين بقوة +88
+                    }
+                    // الفحص الشامل لليسار
+                    FfbCommand::SweepLeft => {
+                        sweep_active = true;
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0xa8, 0, 0, 0, 0, 0]); // لف شمال بقوة -88
+                    }
+                    // إنهاء الفحص والرجوع للمنتصف
+                    FfbCommand::SweepEnd => {
+                        sweep_active = false;
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]); // إعادة تشغيل السبرنج
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
                     }
                 }
             }
 
-            // استقبال وإرسال قوى DiRT 2 الحية
-            if GAME_FFB_ACTIVE.load(Ordering::Relaxed) {
+            // استقبال وإرسال قوى اللعبة الحية
+            if !sweep_active && GAME_FFB_ACTIVE.load(Ordering::Relaxed) {
                 let raw_mag = GAME_FFB_MAGNITUDE.load(Ordering::Relaxed);
                 let sign = if user_invert { 1.0 } else { -1.0 };
                 let f_norm = (raw_mag as f32 / 10000.0) * sign;
@@ -907,7 +928,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                     last_sent_ffb = force_byte;
                     last_ffb_time = Instant::now();
                 }
-            } else if last_sent_ffb != 0 {
+            } else if !sweep_active && last_sent_ffb != 0 {
                 let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
                 last_sent_ffb = 0;
                 state.lock().unwrap().game_ffb_force = 0.0;
@@ -930,9 +951,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         let b_pct = brake_calib.process(lt, true);
                         let t_pct = throttle_calib.process(rt, true);
 
-                        // ----------------------------------------------------
-                        // تسجيل كل ضغطة زرار ودواسة بالاسم في الـ Log!
-                        // ----------------------------------------------------
+                        // تسجيل ضغطات الأزرار بالاسم
                         if buttons != last_buttons {
                             for &(bit, name) in BUTTON_NAMES {
                                 if (buttons & bit != 0) && (last_buttons & bit == 0) {
@@ -964,7 +983,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                             last_brake_active = false;
                         }
 
-                        // تسجيل زوايا الدريكسون المهمة (المنتصف / أقصى اليمين / أقصى الشمال)
+                        // زوايا أقصى اليمين والشمال والمنتصف
                         let quad = if lx > 24000 { 2 } else if lx > 8000 { 1 } else if lx < -24000 { -2 } else if lx < -8000 { -1 } else { 0 };
                         if quad != last_angle_quadrant {
                             match quad {
@@ -1024,10 +1043,12 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         };
                         vjoy_dev.set_pov(pov);
 
+                        // تهيئة قناة القوة المستمرة الأبدية (Duration = 0x00)
                         if !motor_inited {
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
-                            let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x02, 0x01, 0x05, 0x01, 0xff, 0xff, 0x00, 0x01]);
+                            // بايت رقم 4 = 0x00 يعني القوة مستمرة للأبد حتى يتم إيقافها
+                            let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x02, 0x01, 0x05, 0x01, 0x00, 0xff, 0x00, 0x01]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x03, 0x01, 0, 0, 0, 0, 0, 0]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x0b, 0x08, 0x00, 0x01, 0, 0, 0, 0]);
