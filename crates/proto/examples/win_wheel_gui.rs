@@ -58,7 +58,7 @@ mod vjoy {
     type FnSetBtn = unsafe extern "system" fn(BOOL, UINT, BYTE) -> BOOL;
     type FnSetDiscPov = unsafe extern "system" fn(i32, UINT, BYTE) -> BOOL;
 
-    extern "system" {
+    unsafe extern "system" {
         fn LoadLibraryA(lpLibFileName: *const u8) -> *mut c_void;
         fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
     }
@@ -204,7 +204,6 @@ impl Default for PedalCalib {
 
 impl PedalCalib {
     fn process(&mut self, raw: u8) -> f32 {
-        // تثبيت نقطة الراحة في أول ربع ثانية
         if self.sample_count < 25 {
             if self.sample_count == 0 {
                 self.rest_baseline = raw;
@@ -215,13 +214,11 @@ impl PedalCalib {
             return 0.0;
         }
 
-        // عزل الكهرباء: أي قراءة أقل من أو قريبة من وضع الراحة (+14) تعتبر 0% تماماً
         let deadzone_threshold = self.rest_baseline.saturating_add(14);
         if raw <= deadzone_threshold {
             return 0.0;
         }
 
-        // تحديث الحد الأقصى عند الضغط الكامل
         if raw > self.max_pressed {
             self.max_pressed = raw;
         }
@@ -325,7 +322,6 @@ impl eframe::App for DashboardApp {
 
         ui.add_space(10.0);
 
-        // الشريط العلوي مع بيان حالة vJoy
         ui.horizontal(|ui| {
             ui.heading(
                 egui::RichText::new("🏎️ XBOX 360 WHEEL TO VJOY FEEDER")
@@ -350,7 +346,6 @@ impl eframe::App for DashboardApp {
         ui.separator();
         ui.add_space(8.0);
 
-        // منطقة الدريكسون والدواسات
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(480.0);
@@ -394,7 +389,6 @@ impl eframe::App for DashboardApp {
         ui.separator();
         ui.add_space(6.0);
 
-        // لوحة الـ Force Feedback
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -543,7 +537,6 @@ fn draw_pedal(ui: &mut egui::Ui, name: &str, pct: f32, color: Color32) {
     });
 }
 
-// محرك الـ USB والربط بـ vJoy في الخلفية
 fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbCommand>) {
     let mut vjoy_dev = vjoy::VJoy::load(1);
     let mut brake_calib = PedalCalib::default();
@@ -634,9 +627,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                             s.connected = true;
                         }
 
-                        // ------------------------------------
-                        // تغذية vJoy بالحركة في نفس اللحظة!
-                        // ------------------------------------
+                        // تغذية vJoy بالحركة في نفس اللحظة
                         let vjoy_steering = (((lx as i32 + 32768) as f64 / 65535.0) * 32767.0 + 1.0) as i32;
                         vjoy_dev.set_axis(vjoy::HID_USAGE_X, vjoy_steering.clamp(1, 32768));
 
@@ -675,7 +666,6 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         };
                         vjoy_dev.set_pov(pov);
 
-                        // التهيئة الأولى للموتور
                         if !motor_inited {
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
