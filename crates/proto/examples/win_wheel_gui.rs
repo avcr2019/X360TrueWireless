@@ -5,6 +5,7 @@ use nusb::transfer::{Buffer, In, Interrupt, Out};
 use nusb::MaybeFuture;
 use std::ffi::c_void;
 use std::f32::consts::PI;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,6 +35,9 @@ mod btn {
     pub const Y: u16 = 0x8000;
 }
 
+// ----------------------------------------------------
+// وحدة vJoy المتكاملة مع الـ Force Feedback Feeder
+// ----------------------------------------------------
 mod vjoy {
     use super::*;
 
@@ -47,6 +51,24 @@ mod vjoy {
     pub const HID_USAGE_Z: UINT = 0x32;
     pub const HID_USAGE_RZ: UINT = 0x35;
 
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    pub struct FfbEffConstant {
+        pub effect_block_index: u8,
+        pub _pad: [u8; 3],
+        pub magnitude: i32, // من -10000 إلى 10000
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    pub struct FfbEffOp {
+        pub effect_block_index: u8,
+        pub _pad: [u8; 3],
+        pub effect_op: u32,
+        pub loop_count: u8,
+        pub _pad2: [u8; 3],
+    }
+
     type FnVJoyEnabled = unsafe extern "system" fn() -> BOOL;
     type FnGetVJDStatus = unsafe extern "system" fn(UINT) -> i32;
     type FnAcquireVJD = unsafe extern "system" fn(UINT) -> BOOL;
@@ -55,9 +77,41 @@ mod vjoy {
     type FnSetBtn = unsafe extern "system" fn(BOOL, UINT, BYTE) -> BOOL;
     type FnSetDiscPov = unsafe extern "system" fn(i32, UINT, BYTE) -> BOOL;
 
+    type FfbGenCB = unsafe extern "system" fn(*const c_void, *mut c_void);
+    type FnFfbStart = unsafe extern "system" fn(UINT) -> BOOL;
+    type FnFfbRegisterGenCB = unsafe extern "system" fn(FfbGenCB, *mut c_void);
+    pub type FnFfbEffConstant = unsafe extern "system" fn(*const c_void, *mut FfbEffConstant) -> u32;
+    pub type FnFfbEffOp = unsafe extern "system" fn(*const c_void, *mut FfbEffOp) -> u32;
+
     unsafe extern "system" {
         fn LoadLibraryA(lpLibFileName: *const u8) -> *mut c_void;
         fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
+    }
+
+    pub struct FfbContext {
+        pub fn_eff_const: FnFfbEffConstant,
+        pub fn_eff_op: Option<FnFfbEffOp>,
+        pub tx_ffb: Sender<FfbEvent>,
+    }
+
+    pub unsafe extern "system" fn ffb_callback(p_packet: *const c_void, p_ctx: *mut c_void) {
+        if p_packet.is_null() || p_ctx.is_null() {
+            return;
+        }
+        let ctx = &*(p_ctx as *const FfbContext);
+
+        if let Some(f_op) = ctx.fn_eff_op {
+            let mut op = FfbEffOp::default();
+            if f_op(p_packet, &mut op) == 0 && op.effect_op == 3 {
+                let _ = ctx.tx_ffb.send(FfbEvent::Stop);
+                return;
+            }
+        }
+
+        let mut eff_const = FfbEffConstant::default();
+        if (ctx.fn_eff_const)(p_packet, &mut eff_const) == 0 {
+            let _ = ctx.tx_ffb.send(FfbEvent::Force(eff_const.magnitude));
+        }
     }
 
     pub struct VJoy {
@@ -70,6 +124,10 @@ mod vjoy {
         p_set_btn: Option<FnSetBtn>,
         p_set_disc_pov: Option<FnSetDiscPov>,
         p_relinquish: Option<FnRelinquishVJD>,
+        p_ffb_start: Option<FnFfbStart>,
+        p_ffb_reg: Option<FnFfbRegisterGenCB>,
+        pub fn_eff_const: Option<FnFfbEffConstant>,
+        pub fn_eff_op: Option<FnFfbEffOp>,
     }
 
     impl VJoy {
@@ -84,6 +142,10 @@ mod vjoy {
                 p_set_btn: None,
                 p_set_disc_pov: None,
                 p_relinquish: None,
+                p_ffb_start: None,
+                p_ffb_reg: None,
+                fn_eff_const: None,
+                fn_eff_op: None,
             };
 
             let paths: [&[u8]; 3] = [
@@ -117,6 +179,11 @@ mod vjoy {
                 vjoy.p_set_disc_pov = std::mem::transmute(get_fn(b"SetDiscPov\0"));
                 vjoy.p_relinquish = std::mem::transmute(get_fn(b"RelinquishVJD\0"));
 
+                vjoy.p_ffb_start = std::mem::transmute(get_fn(b"FfbStart\0"));
+                vjoy.p_ffb_reg = std::mem::transmute(get_fn(b"FfbRegisterGenCB\0"));
+                vjoy.fn_eff_const = std::mem::transmute(get_fn(b"Ffb_h_Eff_Constant\0"));
+                vjoy.fn_eff_op = std::mem::transmute(get_fn(b"Ffb_h_EffOp\0"));
+
                 if let Some(f_en) = fn_enabled {
                     if f_en() != 0 {
                         vjoy.enabled = true;
@@ -137,10 +204,21 @@ mod vjoy {
                     let stat = f_stat(self.dev_id);
                     if (stat == 0 || stat == 1) && f_acq(self.dev_id) != 0 {
                         self.acquired = true;
+                        if let Some(f_start) = self.p_ffb_start {
+                            f_start(self.dev_id);
+                        }
                     }
                 }
             }
             self.acquired
+        }
+
+        pub fn register_ffb(&self, p_ctx: *mut FfbContext) {
+            if let Some(f_reg) = self.p_ffb_reg {
+                unsafe {
+                    f_reg(ffb_callback, p_ctx as *mut c_void);
+                }
+            }
         }
 
         pub fn set_axis(&self, axis: UINT, value: i32) {
@@ -179,7 +257,12 @@ mod vjoy {
     }
 }
 
-// معايرة عزل نقطة الصفر
+pub enum FfbEvent {
+    Force(i32),
+    Stop,
+}
+
+// معايرة الدواسات وعزل نقطة الصفر
 #[derive(Clone, Copy)]
 struct PedalCalib {
     rest_baseline: u8,
@@ -203,7 +286,6 @@ impl PedalCalib {
             return 0.0;
         }
 
-        // أخذ عينات وضع الراحة بعد التأكد التام من اتصال الدريكسون
         if self.sample_count < 20 {
             if self.sample_count == 0 {
                 self.rest_baseline = raw;
@@ -246,6 +328,7 @@ struct WheelState {
     brake_pct: f32,
     throttle_pct: f32,
     buttons: u16,
+    game_ffb_force: f32, // قوة الـ FFB الحية من اللعبة للعرض
 }
 
 enum FfbCommand {
@@ -254,6 +337,8 @@ enum FfbCommand {
     ConstantForce(i8),
     Rumble(u8, u8),
     ResetPedals,
+    Gain(f32),
+    Invert(bool),
 }
 
 fn main() -> eframe::Result<()> {
@@ -269,8 +354,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Xbox 360 Wheel Studio & vJoy Feeder")
-            .with_inner_size([780.0, 660.0])
+            .with_title("Xbox 360 Wheel Studio & DirectInput FFB Feeder")
+            .with_inner_size([780.0, 690.0])
             .with_resizable(false),
         ..Default::default()
     };
@@ -290,6 +375,8 @@ struct DashboardApp {
     test_force: f32,
     rumble_strong: u8,
     rumble_weak: u8,
+    ffb_gain: f32,
+    invert_ffb: bool,
 }
 
 impl DashboardApp {
@@ -302,6 +389,8 @@ impl DashboardApp {
             test_force: 0.0,
             rumble_strong: 0,
             rumble_weak: 0,
+            ffb_gain: 1.0,
+            invert_ffb: false,
         }
     }
 }
@@ -316,17 +405,18 @@ impl eframe::App for DashboardApp {
 
         ui.add_space(10.0);
 
+        // الشريط العلوي
         ui.horizontal(|ui| {
             ui.heading(
-                egui::RichText::new("🏎️ XBOX 360 WHEEL TO VJOY FEEDER")
+                egui::RichText::new("🏎️ XBOX 360 RACING WHEEL STUDIO")
                     .color(Color32::WHITE)
                     .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if current.vjoy_connected {
-                    ui.label(egui::RichText::new("● vJoy: ACTIVE & FEEDING").color(Color32::from_rgb(0, 230, 118)).strong());
+                    ui.label(egui::RichText::new("● vJoy: ACTIVE & FFB READY").color(Color32::from_rgb(0, 230, 118)).strong());
                 } else {
-                    ui.label(egui::RichText::new("⚠ vJoy: BUSY OR NOT FOUND").color(Color32::from_rgb(255, 171, 0)).strong());
+                    ui.label(egui::RichText::new("⚠ vJoy: BUSY / NOT FOUND").color(Color32::from_rgb(255, 171, 0)).strong());
                 }
                 ui.add_space(10.0);
                 if current.connected {
@@ -340,6 +430,7 @@ impl eframe::App for DashboardApp {
         ui.separator();
         ui.add_space(8.0);
 
+        // منطقة الدريكسون والدواسات
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(480.0);
@@ -378,14 +469,15 @@ impl eframe::App for DashboardApp {
             });
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         ui.separator();
         ui.add_space(6.0);
 
+        // لوحة الـ Game Force Feedback الحية والتحكم
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("⚡ FORCE FEEDBACK REAL-TIME TEST").color(Color32::WHITE).strong());
+                ui.label(egui::RichText::new("🎮 GAME LIVE FORCE FEEDBACK (DiRT 2 / FORZA)").color(Color32::from_rgb(0, 229, 255)).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let motor_label = if self.motor_on { "MOTOR: ENABLED" } else { "MOTOR: DISABLED" };
                     let motor_color = if self.motor_on { Color32::from_rgb(0, 230, 118) } else { Color32::GRAY };
@@ -396,42 +488,77 @@ impl eframe::App for DashboardApp {
                 });
             });
 
-            ui.add_space(6.0);
+            ui.add_space(4.0);
 
+            // شريط إشارة صدمات اللعبة الحية
             ui.horizontal(|ui| {
-                ui.label("Autocenter Resistance Strength:");
-                if ui.add(egui::Slider::new(&mut self.autocenter_val, 0..=31).text("Steps")).changed() {
-                    let _ = self.tx.send(FfbCommand::Autocenter(self.autocenter_val));
+                ui.label("Live Game FFB Signal:");
+                draw_ffb_meter(ui, current.game_ffb_force);
+                ui.label(format!("{:+4.0}%", current.game_ffb_force * 100.0));
+            });
+
+            ui.add_space(4.0);
+
+            // إعدادات قوة الصدمات وعكس الاتجاه
+            ui.horizontal(|ui| {
+                ui.label("FFB Gain Multiplier:");
+                if ui.add(egui::Slider::new(&mut self.ffb_gain, 0.0..=2.0).text("Strength")).changed() {
+                    let _ = self.tx.send(FfbCommand::Gain(self.ffb_gain));
+                }
+                ui.add_space(10.0);
+                if ui.checkbox(&mut self.invert_ffb, "Invert FFB Direction").changed() {
+                    let _ = self.tx.send(FfbCommand::Invert(self.invert_ffb));
                 }
             });
 
+            ui.separator();
+
+            // اختبارات يدوية
             ui.horizontal(|ui| {
-                ui.label("Test Push Force (Motor):");
+                ui.label("Autocenter Return:");
+                if ui.add(egui::Slider::new(&mut self.autocenter_val, 0..=31).text("Steps")).changed() {
+                    let _ = self.tx.send(FfbCommand::Autocenter(self.autocenter_val));
+                }
+                ui.add_space(15.0);
+                ui.label("Manual Push Test:");
                 let slider = ui.add(egui::Slider::new(&mut self.test_force, -100.0..=100.0).text("% Force"));
                 if slider.changed() {
                     let force_byte = (self.test_force * 1.27) as i8;
                     let _ = self.tx.send(FfbCommand::ConstantForce(force_byte));
                 }
-                if ui.button("Center / Stop").clicked() {
+                if ui.button("Stop").clicked() {
                     self.test_force = 0.0;
                     let _ = self.tx.send(FfbCommand::ConstantForce(0));
                 }
             });
-
-            ui.horizontal(|ui| {
-                ui.label("Rumble Motors:");
-                if ui.add(egui::Slider::new(&mut self.rumble_strong, 0..=255).text("Heavy")).changed()
-                    || ui.add(egui::Slider::new(&mut self.rumble_weak, 0..=255).text("Light")).changed() {
-                    let _ = self.tx.send(FfbCommand::Rumble(self.rumble_strong, self.rumble_weak));
-                }
-                if ui.button("Stop Rumble").clicked() {
-                    self.rumble_strong = 0;
-                    self.rumble_weak = 0;
-                    let _ = self.tx.send(FfbCommand::Rumble(0, 0));
-                }
-            });
         });
     }
+}
+
+fn draw_ffb_meter(ui: &mut egui::Ui, force: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(320.0, 18.0), egui::Sense::hover());
+    let painter = ui.painter();
+
+    painter.rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(28, 32, 40));
+    painter.rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, Color32::from_rgb(50, 55, 65)), StrokeKind::Inside);
+
+    let mid_x = rect.center().x;
+    painter.line_segment([Pos2::new(mid_x, rect.top()), Pos2::new(mid_x, rect.bottom())], Stroke::new(1.5, Color32::GRAY));
+
+    let f = force.clamp(-1.0, 1.0);
+    let bar_width = (rect.width() / 2.0) * f.abs();
+    let bar_rect = if f >= 0.0 {
+        Rect::from_min_size(Pos2::new(mid_x, rect.top() + 2.0), Vec2::new(bar_width, rect.height() - 4.0))
+    } else {
+        Rect::from_min_size(Pos2::new(mid_x - bar_width, rect.top() + 2.0), Vec2::new(bar_width, rect.height() - 4.0))
+    };
+
+    let bar_color = if f.abs() > 0.8 {
+        Color32::from_rgb(255, 59, 48)
+    } else {
+        Color32::from_rgb(0, 229, 255)
+    };
+    painter.rect_filled(bar_rect, CornerRadius::same(2), bar_color);
 }
 
 fn draw_wheel_and_controls(painter: &egui::Painter, rect: Rect, steering: i16, buttons: u16) {
@@ -535,6 +662,21 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
     let mut brake_calib = PedalCalib::default();
     let mut throttle_calib = PedalCalib::default();
 
+    let (tx_ffb, rx_ffb) = channel::<FfbEvent>();
+
+    // تسجيل دالة الـ FFB Callback مع vJoy
+    if vjoy_dev.enabled && vjoy_dev.fn_eff_const.is_some() {
+        let ctx = Box::new(vjoy::FfbContext {
+            fn_eff_const: vjoy_dev.fn_eff_const.unwrap(),
+            fn_eff_op: vjoy_dev.fn_eff_op,
+            tx_ffb,
+        });
+        vjoy_dev.register_ffb(Box::into_raw(ctx));
+    }
+
+    let mut user_gain: f32 = 1.0;
+    let mut user_invert: bool = false;
+
     loop {
         if !vjoy_dev.acquired {
             vjoy_dev.try_acquire();
@@ -580,6 +722,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
             }
             state.lock().unwrap().vjoy_connected = vjoy_dev.acquired;
 
+            // أوامر الواجهة اليدوية
             while let Ok(cmd) = rx_cmd.try_recv() {
                 match cmd {
                     FfbCommand::MotorPower(on) => {
@@ -598,6 +741,34 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                     FfbCommand::ResetPedals => {
                         brake_calib.reset();
                         throttle_calib.reset();
+                    }
+                    FfbCommand::Gain(g) => {
+                        user_gain = g;
+                    }
+                    FfbCommand::Invert(inv) => {
+                        user_invert = inv;
+                    }
+                }
+            }
+
+            // استقبال أوامر الصدمات الحية من اللعبة (DiRT 2 / Forza) عبر vJoy
+            while let Ok(ffb_event) = rx_ffb.try_recv() {
+                match ffb_event {
+                    FfbEvent::Force(mag) => {
+                        // DiRT 2 ترسل القوة من -10000 إلى +10000
+                        let sign = if user_invert { 1.0 } else { -1.0 };
+                        let f_norm = (mag as f32 / 10000.0) * sign;
+                        let total_f = (f_norm * user_gain).clamp(-1.0, 1.0);
+                        let force_byte = (total_f * 127.0) as i8;
+
+                        // تحديث القوة الحية فوراً على موتور الدريكسون عبر الـ USB
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, force_byte as u8, 0, 0, 0, 0, 0]);
+
+                        state.lock().unwrap().game_ffb_force = f_norm;
+                    }
+                    FfbEvent::Stop => {
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
+                        state.lock().unwrap().game_ffb_force = 0.0;
                     }
                 }
             }
@@ -663,6 +834,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         };
                         vjoy_dev.set_pov(pov);
 
+                        // تهيئة قناة الفيدباك في الدريكسون لأول مرة
                         if !motor_inited {
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
