@@ -3,6 +3,7 @@
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use nusb::transfer::{Buffer, In, Interrupt, Out};
 use nusb::MaybeFuture;
+use std::ffi::c_void;
 use std::f32::consts::PI;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -33,65 +34,217 @@ mod btn {
     pub const Y: u16 = 0x8000;
 }
 
+// ----------------------------------------------------
+// وحدة الاتصال المباشر مع درايفر vJoy
+// ----------------------------------------------------
+mod vjoy {
+    use super::*;
+
+    type BOOL = i32;
+    type UINT = u32;
+    type LONG = i32;
+    type BYTE = u8;
+
+    pub const HID_USAGE_X: UINT = 0x30;
+    pub const HID_USAGE_Y: UINT = 0x31;
+    pub const HID_USAGE_Z: UINT = 0x32;
+    pub const HID_USAGE_RZ: UINT = 0x35;
+
+    type FnVJoyEnabled = unsafe extern "system" fn() -> BOOL;
+    type FnGetVJDStatus = unsafe extern "system" fn(UINT) -> i32;
+    type FnAcquireVJD = unsafe extern "system" fn(UINT) -> BOOL;
+    type FnRelinquishVJD = unsafe extern "system" fn(UINT);
+    type FnSetAxis = unsafe extern "system" fn(LONG, UINT, UINT) -> BOOL;
+    type FnSetBtn = unsafe extern "system" fn(BOOL, UINT, BYTE) -> BOOL;
+    type FnSetDiscPov = unsafe extern "system" fn(i32, UINT, BYTE) -> BOOL;
+
+    extern "system" {
+        fn LoadLibraryA(lpLibFileName: *const u8) -> *mut c_void;
+        fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
+    }
+
+    pub struct VJoy {
+        pub enabled: bool,
+        pub acquired: bool,
+        pub dev_id: UINT,
+        p_status: Option<FnGetVJDStatus>,
+        p_acquire: Option<FnAcquireVJD>,
+        p_set_axis: Option<FnSetAxis>,
+        p_set_btn: Option<FnSetBtn>,
+        p_set_disc_pov: Option<FnSetDiscPov>,
+        p_relinquish: Option<FnRelinquishVJD>,
+    }
+
+    impl VJoy {
+        pub fn load(dev_id: UINT) -> Self {
+            let mut vjoy = Self {
+                enabled: false,
+                acquired: false,
+                dev_id,
+                p_status: None,
+                p_acquire: None,
+                p_set_axis: None,
+                p_set_btn: None,
+                p_set_disc_pov: None,
+                p_relinquish: None,
+            };
+
+            let paths: [&[u8]; 3] = [
+                b"vJoyInterface.dll\0",
+                b"C:\\Program Files\\vJoy\\x64\\vJoyInterface.dll\0",
+                b"C:\\Program Files\\vJoy\\vJoyInterface.dll\0",
+            ];
+
+            let mut h_mod = std::ptr::null_mut();
+            for p in paths {
+                unsafe {
+                    h_mod = LoadLibraryA(p.as_ptr());
+                    if !h_mod.is_null() {
+                        break;
+                    }
+                }
+            }
+
+            if h_mod.is_null() {
+                return vjoy;
+            }
+
+            unsafe {
+                let get_fn = |name: &[u8]| -> *mut c_void { GetProcAddress(h_mod, name.as_ptr()) };
+
+                let fn_enabled: Option<FnVJoyEnabled> = std::mem::transmute(get_fn(b"vJoyEnabled\0"));
+                vjoy.p_status = std::mem::transmute(get_fn(b"GetVJDStatus\0"));
+                vjoy.p_acquire = std::mem::transmute(get_fn(b"AcquireVJD\0"));
+                vjoy.p_set_axis = std::mem::transmute(get_fn(b"SetAxis\0"));
+                vjoy.p_set_btn = std::mem::transmute(get_fn(b"SetBtn\0"));
+                vjoy.p_set_disc_pov = std::mem::transmute(get_fn(b"SetDiscPov\0"));
+                vjoy.p_relinquish = std::mem::transmute(get_fn(b"RelinquishVJD\0"));
+
+                if let Some(f_en) = fn_enabled {
+                    if f_en() != 0 {
+                        vjoy.enabled = true;
+                        vjoy.try_acquire();
+                    }
+                }
+            }
+
+            vjoy
+        }
+
+        pub fn try_acquire(&mut self) -> bool {
+            if !self.enabled || self.acquired {
+                return self.acquired;
+            }
+            if let (Some(f_stat), Some(f_acq)) = (self.p_status, self.p_acquire) {
+                unsafe {
+                    let stat = f_stat(self.dev_id);
+                    if (stat == 0 || stat == 1) && f_acq(self.dev_id) != 0 {
+                        self.acquired = true;
+                    }
+                }
+            }
+            self.acquired
+        }
+
+        pub fn set_axis(&self, axis: UINT, value: i32) {
+            if let Some(f) = self.p_set_axis {
+                if self.acquired {
+                    unsafe { f(value, self.dev_id, axis); }
+                }
+            }
+        }
+
+        pub fn set_button(&self, btn: u8, pressed: bool) {
+            if let Some(f) = self.p_set_btn {
+                if self.acquired {
+                    unsafe { f(if pressed { 1 } else { 0 }, self.dev_id, btn); }
+                }
+            }
+        }
+
+        pub fn set_pov(&self, value: i32) {
+            if let Some(f) = self.p_set_disc_pov {
+                if self.acquired {
+                    unsafe { f(value, self.dev_id, 0); }
+                }
+            }
+        }
+    }
+
+    impl Drop for VJoy {
+        fn drop(&mut self) {
+            if self.acquired {
+                if let Some(f) = self.p_relinquish {
+                    unsafe { f(self.dev_id); }
+                }
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------
+// نظام المعايرة الذكي وعزل تداخل الإشارات (Crosstalk)
+// ----------------------------------------------------
 #[derive(Clone, Copy)]
 struct PedalCalib {
-    min: u8,
-    max: u8,
-    initialized: bool,
+    rest_baseline: u8,
+    max_pressed: u8,
+    sample_count: u8,
 }
 
 impl Default for PedalCalib {
     fn default() -> Self {
         Self {
-            min: 255,
-            max: 0,
-            initialized: false,
+            rest_baseline: 0,
+            max_pressed: 255,
+            sample_count: 0,
         }
     }
 }
 
 impl PedalCalib {
     fn process(&mut self, raw: u8) -> f32 {
-        if !self.initialized {
-            self.min = raw;
-            self.max = raw.saturating_add(30);
-            self.initialized = true;
-        }
-
-        // تحديث الحد الأدنى إذا ظهرت قراءة أقل في وضع الراحة
-        if raw < self.min {
-            self.min = raw;
-        }
-        // تحديث الحد الأقصى عند الضغط الكامل
-        if raw > self.max {
-            self.max = raw;
-        }
-
-        let range = (self.max.saturating_sub(self.min)) as f32;
-        if range < 5.0 {
+        // تثبيت نقطة الراحة في أول ربع ثانية
+        if self.sample_count < 25 {
+            if self.sample_count == 0 {
+                self.rest_baseline = raw;
+            } else {
+                self.rest_baseline = ((self.rest_baseline as u16 + raw as u16) / 2) as u8;
+            }
+            self.sample_count += 1;
             return 0.0;
         }
 
-        let val = (raw.saturating_sub(self.min)) as f32 / range;
-        
-        // Deadzone بنسبة 4% لمنع الارتعاش عند وضع الراحة
-        if val < 0.04 {
-            0.0
-        } else {
-            ((val - 0.04) / 0.96).clamp(0.0, 1.0)
+        // عزل الكهرباء: أي قراءة أقل من أو قريبة من وضع الراحة (+14) تعتبر 0% تماماً
+        let deadzone_threshold = self.rest_baseline.saturating_add(14);
+        if raw <= deadzone_threshold {
+            return 0.0;
         }
+
+        // تحديث الحد الأقصى عند الضغط الكامل
+        if raw > self.max_pressed {
+            self.max_pressed = raw;
+        }
+
+        let range = (self.max_pressed.saturating_sub(deadzone_threshold)) as f32;
+        if range < 10.0 {
+            return 0.0;
+        }
+
+        ((raw - deadzone_threshold) as f32 / range).clamp(0.0, 1.0)
     }
 
     fn reset(&mut self) {
-        self.initialized = false;
-        self.min = 255;
-        self.max = 0;
+        self.sample_count = 0;
+        self.rest_baseline = 0;
+        self.max_pressed = 255;
     }
 }
 
 #[derive(Default, Clone)]
 struct WheelState {
     connected: bool,
+    vjoy_connected: bool,
     steering: i16,
     brake_raw: u8,
     throttle_raw: u8,
@@ -112,13 +265,13 @@ fn main() -> eframe::Result<()> {
     {
         let state = state.clone();
         thread::spawn(move || {
-            usb_worker(state, rx_cmd);
+            usb_and_vjoy_worker(state, rx_cmd);
         });
     }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Xbox 360 Wireless Wheel - Dashboard Studio")
+            .with_title("Xbox 360 Wheel Studio & vJoy Feeder")
             .with_inner_size([780.0, 660.0])
             .with_resizable(false),
         ..Default::default()
@@ -167,35 +320,38 @@ impl eframe::App for DashboardApp {
 
         let current = self.state.lock().unwrap().clone();
 
-        // حساب نسب البنزين والفرامل بعد المعايرة الذكية
         let brake_pct = self.brake_calib.process(current.brake_raw);
         let throttle_pct = self.throttle_calib.process(current.throttle_raw);
 
         ui.add_space(10.0);
 
-        // الشريط العلوي
+        // الشريط العلوي مع بيان حالة vJoy
         ui.horizontal(|ui| {
             ui.heading(
-                egui::RichText::new("🏎️ XBOX 360 RACING WHEEL STUDIO")
+                egui::RichText::new("🏎️ XBOX 360 WHEEL TO VJOY FEEDER")
                     .color(Color32::WHITE)
                     .strong(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (txt, color) = if current.connected {
-                    ("● CONNECTED (ONLINE)", Color32::from_rgb(0, 230, 118))
+                if current.vjoy_connected {
+                    ui.label(egui::RichText::new("● vJoy: ACTIVE & FEEDING").color(Color32::from_rgb(0, 230, 118)).strong());
                 } else {
-                    ("○ SEARCHING DONGLE...", Color32::from_rgb(255, 171, 0))
-                };
-                ui.label(egui::RichText::new(txt).color(color).strong());
+                    ui.label(egui::RichText::new("⚠ vJoy: BUSY OR NOT FOUND").color(Color32::from_rgb(255, 171, 0)).strong());
+                }
+                ui.add_space(10.0);
+                if current.connected {
+                    ui.label(egui::RichText::new("● WHEEL: CONNECTED").color(Color32::from_rgb(0, 229, 255)).strong());
+                } else {
+                    ui.label(egui::RichText::new("○ WHEEL: DISCONNECTED").color(Color32::GRAY).strong());
+                }
             });
         });
 
         ui.separator();
         ui.add_space(8.0);
 
-        // منطقة العرض الرئيسية
+        // منطقة الدريكسون والدواسات
         ui.horizontal(|ui| {
-            // الدريكسون والأزرار
             ui.vertical(|ui| {
                 ui.set_width(480.0);
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(470.0, 340.0), egui::Sense::hover());
@@ -215,12 +371,11 @@ impl eframe::App for DashboardApp {
 
             ui.add_space(15.0);
 
-            // الدواسات (معايرة تلقائية)
             ui.vertical(|ui| {
                 ui.set_width(240.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("PEDALS").color(Color32::GRAY).size(13.0));
-                    if ui.button(egui::RichText::new("↺ Reset Calib").size(10.0)).on_hover_text("اضغط لإعادة ضبط نقطة الصفر وأنت سايب الدواسات").clicked() {
+                    ui.label(egui::RichText::new("CALIBRATED PEDALS").color(Color32::GRAY).size(13.0));
+                    if ui.button(egui::RichText::new("↺ Reset Zero").size(10.0)).on_hover_text("اضغط لتثبيت وضع الصفر للدواسات").clicked() {
                         self.brake_calib.reset();
                         self.throttle_calib.reset();
                     }
@@ -243,7 +398,7 @@ impl eframe::App for DashboardApp {
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("⚡ REAL-TIME FORCE FEEDBACK CONTROL").color(Color32::WHITE).strong());
+                ui.label(egui::RichText::new("⚡ FORCE FEEDBACK REAL-TIME TEST").color(Color32::WHITE).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let motor_label = if self.motor_on { "MOTOR: ENABLED" } else { "MOTOR: DISABLED" };
                     let motor_color = if self.motor_on { Color32::from_rgb(0, 230, 118) } else { Color32::GRAY };
@@ -257,7 +412,7 @@ impl eframe::App for DashboardApp {
             ui.add_space(6.0);
 
             ui.horizontal(|ui| {
-                ui.label("Autocenter Return Strength:");
+                ui.label("Autocenter Resistance Strength:");
                 if ui.add(egui::Slider::new(&mut self.autocenter_val, 0..=31).text("Steps")).changed() {
                     let _ = self.tx.send(FfbCommand::Autocenter(self.autocenter_val));
                 }
@@ -388,8 +543,18 @@ fn draw_pedal(ui: &mut egui::Ui, name: &str, pct: f32, color: Color32) {
     });
 }
 
-fn usb_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbCommand>) {
+// محرك الـ USB والربط بـ vJoy في الخلفية
+fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbCommand>) {
+    let mut vjoy_dev = vjoy::VJoy::load(1);
+    let mut brake_calib = PedalCalib::default();
+    let mut throttle_calib = PedalCalib::default();
+
     loop {
+        if !vjoy_dev.acquired {
+            vjoy_dev.try_acquire();
+        }
+        state.lock().unwrap().vjoy_connected = vjoy_dev.acquired;
+
         let Ok(devices) = nusb::list_devices().wait() else {
             thread::sleep(Duration::from_millis(500));
             continue;
@@ -424,6 +589,11 @@ fn usb_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbCommand>) {
         let mut motor_inited = false;
 
         while state.lock().unwrap().connected {
+            if !vjoy_dev.acquired {
+                vjoy_dev.try_acquire();
+            }
+            state.lock().unwrap().vjoy_connected = vjoy_dev.acquired;
+
             while let Ok(cmd) = rx_cmd.try_recv() {
                 match cmd {
                     FfbCommand::MotorPower(on) => {
@@ -464,6 +634,48 @@ fn usb_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbCommand>) {
                             s.connected = true;
                         }
 
+                        // ------------------------------------
+                        // تغذية vJoy بالحركة في نفس اللحظة!
+                        // ------------------------------------
+                        let vjoy_steering = (((lx as i32 + 32768) as f64 / 65535.0) * 32767.0 + 1.0) as i32;
+                        vjoy_dev.set_axis(vjoy::HID_USAGE_X, vjoy_steering.clamp(1, 32768));
+
+                        let b_pct = brake_calib.process(lt);
+                        let t_pct = throttle_calib.process(rt);
+
+                        let vjoy_throttle = (t_pct * 32767.0 + 1.0) as i32;
+                        vjoy_dev.set_axis(vjoy::HID_USAGE_Y, vjoy_throttle.clamp(1, 32768));
+
+                        let vjoy_brake = (b_pct * 32767.0 + 1.0) as i32;
+                        vjoy_dev.set_axis(vjoy::HID_USAGE_Z, vjoy_brake.clamp(1, 32768));
+                        vjoy_dev.set_axis(vjoy::HID_USAGE_RZ, vjoy_brake.clamp(1, 32768));
+
+                        vjoy_dev.set_button(1, buttons & btn::A != 0);
+                        vjoy_dev.set_button(2, buttons & btn::B != 0);
+                        vjoy_dev.set_button(3, buttons & btn::X != 0);
+                        vjoy_dev.set_button(4, buttons & btn::Y != 0);
+                        vjoy_dev.set_button(5, buttons & btn::LB != 0);
+                        vjoy_dev.set_button(6, buttons & btn::RB != 0);
+                        vjoy_dev.set_button(7, buttons & btn::BACK != 0);
+                        vjoy_dev.set_button(8, buttons & btn::START != 0);
+                        vjoy_dev.set_button(9, buttons & btn::LS != 0);
+                        vjoy_dev.set_button(10, buttons & btn::RS != 0);
+                        vjoy_dev.set_button(11, buttons & btn::GUIDE != 0);
+
+                        let pov = if buttons & btn::DPAD_UP != 0 {
+                            0
+                        } else if buttons & btn::DPAD_RIGHT != 0 {
+                            1
+                        } else if buttons & btn::DPAD_DOWN != 0 {
+                            2
+                        } else if buttons & btn::DPAD_LEFT != 0 {
+                            3
+                        } else {
+                            -1
+                        };
+                        vjoy_dev.set_pov(pov);
+
+                        // التهيئة الأولى للموتور
                         if !motor_inited {
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
