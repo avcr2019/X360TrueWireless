@@ -15,6 +15,7 @@ const RECEIVER_IDS: &[(u16, u16)] = &[
     (0x045e, 0x0719),
     (0x045e, 0x0291),
     (0x045e, 0x02a9),
+    (0x045e, 0x0288),
 ];
 
 static START_TIME: OnceLock<Instant> = OnceLock::new();
@@ -206,7 +207,7 @@ mod vjoy {
             }
 
             if h_mod.is_null() {
-                add_log("vJoyInterface.dll not found in standard paths", Color32::from_rgb(255, 171, 0));
+                add_log("vJoyInterface.dll not found", Color32::from_rgb(255, 171, 0));
                 return vjoy;
             }
 
@@ -246,10 +247,9 @@ mod vjoy {
                     let stat = f_stat(self.dev_id);
                     if (stat == 0 || stat == 1) && f_acq(self.dev_id) != 0 {
                         self.acquired = true;
-                        add_log(format!("vJoy Device #{} acquired successfully", self.dev_id), Color32::from_rgb(0, 230, 118));
+                        add_log(format!("vJoy Device #{} acquired", self.dev_id), Color32::from_rgb(0, 230, 118));
                         if let Some(f_start) = self.p_ffb_start {
                             f_start(self.dev_id);
-                            add_log("vJoy FFB queue started", Color32::from_rgb(0, 229, 255));
                         }
                     }
                 }
@@ -261,7 +261,6 @@ mod vjoy {
             if let Some(f_reg) = self.p_ffb_reg {
                 unsafe {
                     f_reg(ffb_callback, p_ctx as *mut c_void);
-                    add_log("Registered DirectInput FFB callback", Color32::from_rgb(0, 229, 255));
                 }
             }
         }
@@ -329,11 +328,9 @@ impl PedalCalib {
             if raw < 135 {
                 self.rest_baseline = raw;
                 self.initialized = true;
-                add_log(format!("Auto-Calibrated Zero baseline to: {}", raw), Color32::YELLOW);
             } else {
                 self.rest_baseline = 90;
                 self.initialized = true;
-                add_log("Pedal pressed on startup; defaulted zero to 90", Color32::from_rgb(255, 171, 0));
             }
         }
 
@@ -359,8 +356,6 @@ impl PedalCalib {
             self.rest_baseline = current_raw;
             self.initialized = true;
             add_log(format!("↺ Zero reset for {} -> {}", name, current_raw), Color32::from_rgb(0, 230, 118));
-        } else {
-            add_log(format!("⚠ Cannot reset {} while pedal is pressed (raw={})", name, current_raw), Color32::from_rgb(255, 59, 48));
         }
     }
 }
@@ -407,7 +402,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Xbox 360 Wheel Studio & FFB Feeder - Pro Edition")
+            .with_title("Xbox 360 Wheel Studio & FFB Feeder")
             .with_inner_size([1040.0, 710.0])
             .with_min_inner_size([750.0, 520.0])
             .with_resizable(true),
@@ -462,7 +457,6 @@ impl eframe::App for DashboardApp {
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
-            // الجزء الأيسر
             ui.vertical(|ui| {
                 ui.set_width(710.0);
 
@@ -476,7 +470,7 @@ impl eframe::App for DashboardApp {
                         if current.vjoy_connected {
                             ui.label(egui::RichText::new("● vJoy: ACTIVE").color(Color32::from_rgb(0, 230, 118)).strong());
                         } else {
-                            ui.label(egui::RichText::new("⚠ vJoy: BUSY / OFF").color(Color32::from_rgb(255, 171, 0)).strong());
+                            ui.label(egui::RichText::new("⚠ vJoy: OFF").color(Color32::from_rgb(255, 171, 0)).strong());
                         }
                         ui.add_space(8.0);
                         if current.connected {
@@ -508,25 +502,22 @@ impl eframe::App for DashboardApp {
 
                         ui.add_space(4.0);
 
-                        // أزرار المعايرة والتوسيط بعد تفعيل الحركة الفيزيائية
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            if ui.button(egui::RichText::new("🎯 Center Wheel").size(12.0).color(Color32::from_rgb(0, 230, 118))).on_hover_text("سحب الدريكسون للمنتصف فوراً").clicked() {
+                            if ui.button(egui::RichText::new("🎯 Center Wheel").size(12.0).color(Color32::from_rgb(0, 230, 118))).clicked() {
                                 let _ = self.tx.send(FfbCommand::CenterWheel);
                             }
 
-                            if ui.add_enabled(!self.is_testing_sweep, egui::Button::new(egui::RichText::new("🔄 Lock-to-Lock Sweep Test").size(12.0).color(Color32::from_rgb(0, 229, 255))))
-                                .on_hover_text("فحص حركة الدريكسون 135 يمين ثم 135 شمال ثم التوسيط").clicked() {
+                            if ui.add_enabled(!self.is_testing_sweep, egui::Button::new(egui::RichText::new("🔄 Sweep Test").size(12.0).color(Color32::from_rgb(0, 229, 255)))).clicked() {
                                 self.is_testing_sweep = true;
                                 let tx_clone = self.tx.clone();
                                 thread::spawn(move || {
-                                    add_log(">>> Starting Lock-to-Lock Sweep Test...", Color32::YELLOW);
                                     let _ = tx_clone.send(FfbCommand::SweepRight);
                                     thread::sleep(Duration::from_millis(900));
                                     let _ = tx_clone.send(FfbCommand::SweepLeft);
                                     thread::sleep(Duration::from_millis(1600));
                                     let _ = tx_clone.send(FfbCommand::SweepEnd);
-                                    add_log("<<< Sweep Test Completed! Centered.", Color32::from_rgb(0, 230, 118));
+                                    let _ = tx_clone.send(FfbCommand::CenterWheel);
                                 });
                                 self.is_testing_sweep = false;
                             }
@@ -535,12 +526,11 @@ impl eframe::App for DashboardApp {
 
                     ui.add_space(8.0);
 
-                    // الدواسات
                     ui.vertical(|ui| {
                         ui.set_width(240.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("PEDALS").color(Color32::GRAY).size(13.0));
-                            if ui.button(egui::RichText::new("↺ Reset Zero").size(11.0)).on_hover_text("اضغط لتثبيت الصفر وأنت سايب الدواسات تماماً").clicked() {
+                            if ui.button(egui::RichText::new("↺ Reset Zero").size(11.0)).clicked() {
                                 let _ = self.tx.send(FfbCommand::ResetPedals);
                             }
                         });
@@ -557,11 +547,10 @@ impl eframe::App for DashboardApp {
                 ui.add_space(6.0);
                 ui.separator();
 
-                // لوحة صدمات اللعبة والـ FFB
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("🎮 GAME LIVE FORCE FEEDBACK (DiRT 2 / FORZA)").color(Color32::from_rgb(0, 229, 255)).strong());
+                        ui.label(egui::RichText::new("🎮 GAME LIVE FORCE FEEDBACK").color(Color32::from_rgb(0, 229, 255)).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let motor_label = if self.motor_on { "MOTOR: ON" } else { "MOTOR: OFF" };
                             let motor_color = if self.motor_on { Color32::from_rgb(0, 230, 118) } else { Color32::GRAY };
@@ -620,7 +609,7 @@ impl eframe::App for DashboardApp {
                 ui.set_width(ui.available_width().max(280.0));
 
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("📜 LIVE DIAGNOSTIC LOG").color(Color32::WHITE).strong());
+                    ui.label(egui::RichText::new("📜 LIVE LOG").color(Color32::WHITE).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("🗑 Clear").clicked() {
                             LOG_ENTRIES.lock().unwrap().clear();
@@ -661,13 +650,10 @@ impl eframe::App for DashboardApp {
 fn draw_ffb_meter(ui: &mut egui::Ui, force: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(260.0, 16.0), egui::Sense::hover());
     let painter = ui.painter();
-
     painter.rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(28, 32, 40));
     painter.rect_stroke(rect, CornerRadius::same(4), Stroke::new(1.0, Color32::from_rgb(50, 55, 65)), StrokeKind::Inside);
-
     let mid_x = rect.center().x;
     painter.line_segment([Pos2::new(mid_x, rect.top()), Pos2::new(mid_x, rect.bottom())], Stroke::new(1.5, Color32::GRAY));
-
     let f = force.clamp(-1.0, 1.0);
     let bar_width = (rect.width() / 2.0) * f.abs();
     let bar_rect = if f >= 0.0 {
@@ -675,12 +661,7 @@ fn draw_ffb_meter(ui: &mut egui::Ui, force: f32) {
     } else {
         Rect::from_min_size(Pos2::new(mid_x - bar_width, rect.top() + 2.0), Vec2::new(bar_width, rect.height() - 4.0))
     };
-
-    let bar_color = if f.abs() > 0.8 {
-        Color32::from_rgb(255, 59, 48)
-    } else {
-        Color32::from_rgb(0, 229, 255)
-    };
+    let bar_color = if f.abs() > 0.8 { Color32::from_rgb(255, 59, 48) } else { Color32::from_rgb(0, 229, 255) };
     painter.rect_filled(bar_rect, CornerRadius::same(2), bar_color);
 }
 
@@ -692,18 +673,10 @@ fn draw_wheel_and_controls(painter: &egui::Painter, rect: Rect, steering: i16, b
     let left_paddle_color = if buttons & btn::LB != 0 { Color32::from_rgb(0, 229, 255) } else { Color32::from_rgb(45, 50, 60) };
     let right_paddle_color = if buttons & btn::RB != 0 { Color32::from_rgb(0, 229, 255) } else { Color32::from_rgb(45, 50, 60) };
 
-    painter.rect_filled(
-        Rect::from_min_size(center + Vec2::new(-155.0, -42.0), Vec2::new(24.0, 84.0)),
-        CornerRadius::same(6),
-        left_paddle_color,
-    );
+    painter.rect_filled(Rect::from_min_size(center + Vec2::new(-155.0, -42.0), Vec2::new(24.0, 84.0)), CornerRadius::same(6), left_paddle_color);
     painter.text(center + Vec2::new(-143.0, 0.0), egui::Align2::CENTER_CENTER, "LB", egui::FontId::proportional(11.0), Color32::WHITE);
 
-    painter.rect_filled(
-        Rect::from_min_size(center + Vec2::new(131.0, -42.0), Vec2::new(24.0, 84.0)),
-        CornerRadius::same(6),
-        right_paddle_color,
-    );
+    painter.rect_filled(Rect::from_min_size(center + Vec2::new(131.0, -42.0), Vec2::new(24.0, 84.0)), CornerRadius::same(6), right_paddle_color);
     painter.text(center + Vec2::new(143.0, 0.0), egui::Align2::CENTER_CENTER, "RB", egui::FontId::proportional(11.0), Color32::WHITE);
 
     painter.circle_stroke(center, radius, Stroke::new(17.0, Color32::from_rgb(32, 35, 42)));
@@ -811,28 +784,51 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
         }
         state.lock().unwrap().vjoy_connected = vjoy_dev.acquired;
 
-        let Ok(devices) = nusb::list_devices().wait() else {
-            thread::sleep(Duration::from_millis(500));
-            continue;
+        // بحث شامل وذكي عن أي دونجل إكس بوكس 360 متصل بغض النظر عن الـ Product ID
+        let devices = match nusb::list_devices().wait() {
+            Ok(d) => d,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
         };
-        let Some(info) = devices.into_iter().find(|d| RECEIVER_IDS.contains(&(d.vendor_id(), d.product_id()))) else {
+
+        let target_device = devices.into_iter().find(|d| {
+            RECEIVER_IDS.contains(&(d.vendor_id(), d.product_id())) || d.vendor_id() == 0x045e
+        });
+
+        let Some(info) = target_device else {
             state.lock().unwrap().connected = false;
             thread::sleep(Duration::from_millis(500));
             continue;
         };
-        let Ok(device) = info.open().wait() else {
-            thread::sleep(Duration::from_millis(500));
-            continue;
+
+        let device = match info.open().wait() {
+            Ok(dev) => dev,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
         };
-        let Ok(iface) = device.claim_interface(0).wait() else {
-            thread::sleep(Duration::from_millis(500));
-            continue;
+
+        // محاولة الاتصال بالواجهة 0 أو أي واجهة متاحة للدونجل
+        let iface = match device.claim_interface(0).wait() {
+            Ok(i) => i,
+            Err(_) => match device.claim_interface(2).wait() {
+                Ok(i) => i,
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            },
         };
-        let (Ok(mut ep_in), Ok(mut ep_out)) = (
+
+        let (mut ep_in, mut ep_out) = match (
             iface.endpoint::<Interrupt, In>(0x81),
             iface.endpoint::<Interrupt, Out>(0x01),
-        ) else {
-            continue;
+        ) {
+            (Ok(i), Ok(o)) => (i, o),
+            _ => continue,
         };
 
         for _ in 0..4 {
@@ -877,43 +873,36 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                     }
                     FfbCommand::Gain(g) => {
                         user_gain = g;
-                        add_log(format!("FFB Gain set to {:.1}x", g), Color32::YELLOW);
                     }
                     FfbCommand::Invert(inv) => {
                         user_invert = inv;
-                        add_log(format!("FFB Invert: {}", inv), Color32::YELLOW);
                     }
-                    // توسيط الدريكسون فوراً
                     FfbCommand::CenterWheel => {
                         sweep_active = false;
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]); // motor on
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]); // start autocenter
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]); // full strength
-                        add_log("Wheel Centered by Autocenter motor", Color32::from_rgb(0, 230, 118));
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]);
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]);
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
+                        add_log("Wheel Centered", Color32::from_rgb(0, 230, 118));
                     }
-                    // الفحص الشامل لليمين
                     FfbCommand::SweepRight => {
                         sweep_active = true;
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x10]); // إيقاف السبرنج مؤقتاً لإطلاق عزم الموتور
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x58, 0, 0, 0, 0, 0]); // لف يمين بقوة +88
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x10]);
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x58, 0, 0, 0, 0, 0]);
                     }
-                    // الفحص الشامل لليسار
                     FfbCommand::SweepLeft => {
                         sweep_active = true;
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0xa8, 0, 0, 0, 0, 0]); // لف شمال بقوة -88
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0xa8, 0, 0, 0, 0, 0]);
                     }
-                    // إنهاء الفحص والرجوع للمنتصف
                     FfbCommand::SweepEnd => {
                         sweep_active = false;
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]); // إعادة تشغيل السبرنج
+                        let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]);
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
                     }
                 }
             }
 
-            // استقبال وإرسال قوى اللعبة الحية
             if !sweep_active && GAME_FFB_ACTIVE.load(Ordering::Relaxed) {
                 let raw_mag = GAME_FFB_MAGNITUDE.load(Ordering::Relaxed);
                 let sign = if user_invert { 1.0 } else { -1.0 };
@@ -951,7 +940,6 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         let b_pct = brake_calib.process(lt, true);
                         let t_pct = throttle_calib.process(rt, true);
 
-                        // تسجيل ضغطات الأزرار بالاسم
                         if buttons != last_buttons {
                             for &(bit, name) in BUTTON_NAMES {
                                 if (buttons & bit != 0) && (last_buttons & bit == 0) {
@@ -963,33 +951,30 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                             last_buttons = buttons;
                         }
 
-                        // تسجيل البنزين
                         let t_active = t_pct > 0.03;
                         if t_active && !last_throttle_active {
-                            add_log(format!("Throttle Pressed: {:.0}%", t_pct * 100.0), Color32::from_rgb(52, 199, 89));
+                            add_log(format!("Throttle: {:.0}%", t_pct * 100.0), Color32::from_rgb(52, 199, 89));
                             last_throttle_active = true;
                         } else if !t_active && last_throttle_active {
-                            add_log("Throttle Released (0%)", Color32::GRAY);
+                            add_log("Throttle Released", Color32::GRAY);
                             last_throttle_active = false;
                         }
 
-                        // تسجيل الفرامل
                         let b_active = b_pct > 0.03;
                         if b_active && !last_brake_active {
-                            add_log(format!("Brake Pressed: {:.0}%", b_pct * 100.0), Color32::from_rgb(255, 59, 48));
+                            add_log(format!("Brake: {:.0}%", b_pct * 100.0), Color32::from_rgb(255, 59, 48));
                             last_brake_active = true;
                         } else if !b_active && last_brake_active {
-                            add_log("Brake Released (0%)", Color32::GRAY);
+                            add_log("Brake Released", Color32::GRAY);
                             last_brake_active = false;
                         }
 
-                        // زوايا أقصى اليمين والشمال والمنتصف
                         let quad = if lx > 24000 { 2 } else if lx > 8000 { 1 } else if lx < -24000 { -2 } else if lx < -8000 { -1 } else { 0 };
                         if quad != last_angle_quadrant {
                             match quad {
-                                2 => add_log("Steering: Right Full Lock (135°)", Color32::from_rgb(0, 229, 255)),
-                                -2 => add_log("Steering: Left Full Lock (-135°)", Color32::from_rgb(0, 229, 255)),
-                                0 if last_angle_quadrant.abs() >= 1 => add_log("Steering: Returned to Center", Color32::GRAY),
+                                2 => add_log("Steering: Right Full Lock", Color32::from_rgb(0, 229, 255)),
+                                -2 => add_log("Steering: Left Full Lock", Color32::from_rgb(0, 229, 255)),
+                                0 if last_angle_quadrant.abs() >= 1 => add_log("Steering: Center", Color32::GRAY),
                                 _ => {}
                             }
                             last_angle_quadrant = quad;
@@ -1000,8 +985,8 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                             s.steering = lx;
                             s.brake_raw = lt;
                             s.throttle_raw = rt;
-                            s.brake_zero = brake_calib.rest_baseline;
-                            s.throttle_zero = throttle_calib.rest_baseline;
+                            s.brake_zero = brake_cal_zero(&brake_calib);
+                            s.throttle_zero = brake_cal_zero(&throttle_calib);
                             s.brake_pct = b_pct;
                             s.throttle_pct = t_pct;
                             s.buttons = buttons;
@@ -1030,30 +1015,22 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         vjoy_dev.set_button(10, buttons & btn::RS != 0);
                         vjoy_dev.set_button(11, buttons & btn::GUIDE != 0);
 
-                        let pov = if buttons & btn::DPAD_UP != 0 {
-                            0
-                        } else if buttons & btn::DPAD_RIGHT != 0 {
-                            1
-                        } else if buttons & btn::DPAD_DOWN != 0 {
-                            2
-                        } else if buttons & btn::DPAD_LEFT != 0 {
-                            3
-                        } else {
-                            -1
-                        };
+                        let pov = if buttons & btn::DPAD_UP != 0 { 0 }
+                        else if buttons & btn::DPAD_RIGHT != 0 { 1 }
+                        else if buttons & btn::DPAD_DOWN != 0 { 2 }
+                        else if buttons & btn::DPAD_LEFT != 0 { 3 }
+                        else { -1 };
                         vjoy_dev.set_pov(pov);
 
-                        // تهيئة قناة القوة المستمرة الأبدية (Duration = 0x00)
                         if !motor_inited {
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
-                            // بايت رقم 4 = 0x00 يعني القوة مستمرة للأبد حتى يتم إيقافها
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x02, 0x01, 0x05, 0x01, 0x00, 0xff, 0x00, 0x01]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, 0x00, 0, 0, 0, 0, 0]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x03, 0x01, 0, 0, 0, 0, 0, 0]);
                             let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x0b, 0x08, 0x00, 0x01, 0, 0, 0, 0]);
                             motor_inited = true;
-                            add_log("FFB Engine & Motor Initialized", Color32::from_rgb(0, 230, 118));
+                            add_log("Motor Initialized", Color32::from_rgb(0, 230, 118));
                         }
                     }
                 }
@@ -1063,6 +1040,10 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
             }
         }
     }
+}
+
+fn brake_cal_zero(c: &PedalCalib) -> u8 {
+    c.rest_baseline
 }
 
 fn send_pkt(ep: &mut nusb::Endpoint<Interrupt, Out>, packet: &[u8]) -> Result<(), nusb::transfer::TransferError> {
