@@ -121,11 +121,11 @@ mod vjoy {
         if p_packet.is_null() || p_ctx.is_null() {
             return;
         }
-        let ctx = &*(p_ctx as *const FfbContext);
+        let ctx = unsafe { &*(p_ctx as *const FfbContext) };
 
         if let Some(f_op) = ctx.fn_eff_op {
             let mut op = FfbEffOp::default();
-            if f_op(p_packet, &mut op) == 0 && op.effect_op == 3 {
+            if unsafe { f_op(p_packet, &mut op) } == 0 && op.effect_op == 3 {
                 GAME_FFB_MAGNITUDE.store(0, Ordering::Relaxed);
                 GAME_FFB_ACTIVE.store(false, Ordering::Relaxed);
                 return;
@@ -133,7 +133,7 @@ mod vjoy {
         }
 
         let mut eff_const = FfbEffConstant::default();
-        if (ctx.fn_eff_const)(p_packet, &mut eff_const) == 0 {
+        if unsafe { (ctx.fn_eff_const)(p_packet, &mut eff_const) } == 0 {
             GAME_FFB_MAGNITUDE.store(eff_const.magnitude, Ordering::Relaxed);
             GAME_FFB_ACTIVE.store(true, Ordering::Relaxed);
         }
@@ -312,17 +312,15 @@ impl PedalCalib {
             return 0.0;
         }
 
-        // الحماية الذهبية: إذا لم تتم المعايرة، اقبل فقط رقماً منطقياً لوضع الراحة (< 135)
         if !self.initialized {
             if raw < 135 {
                 self.rest_baseline = raw;
                 self.initialized = true;
-                add_log(format!("Auto-Calibrated Zero baseline to: {}", raw), Color32::YELLOW);
+                add_log(format!("Auto-Calibrated Zero to: {}", raw), Color32::YELLOW);
             } else {
-                // إذا فتح البرنامج ورجلك على الدواسة، لا تجعل الصفر 255 أبداً بل اجعله افتراضياً 90
                 self.rest_baseline = 90;
                 self.initialized = true;
-                add_log("Pedal pressed on startup; defaulted zero to 90 to prevent freeze", Color32::from_rgb(255, 171, 0));
+                add_log("Pedal pressed on startup; defaulted zero to 90", Color32::from_rgb(255, 171, 0));
             }
         }
 
@@ -443,15 +441,11 @@ impl eframe::App for DashboardApp {
 
         ui.add_space(8.0);
 
-        // واجهة مقسمة: جزء التحكم على اليسار، وجزء الـ Log الحي على اليمين
         ui.horizontal(|ui| {
-            // ============================================
-            // الجزء الأيسر: الدريكسون، الدواسات، والـ FFB
-            // ============================================
+            // الجزء الأيسر: التحكم والدريكسون
             ui.vertical(|ui| {
                 ui.set_width(720.0);
 
-                // الشريط العلوي
                 ui.horizontal(|ui| {
                     ui.heading(
                         egui::RichText::new("🏎️ XBOX 360 WHEEL TO VJOY")
@@ -476,7 +470,6 @@ impl eframe::App for DashboardApp {
                 ui.separator();
                 ui.add_space(4.0);
 
-                // الدريكسون والدواسات
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(450.0);
@@ -519,7 +512,7 @@ impl eframe::App for DashboardApp {
                 ui.add_space(6.0);
                 ui.separator();
 
-                // لوحة صدمات اللعبة والـ FFB
+                // لوحة التحكم والـ FFB
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -577,9 +570,7 @@ impl eframe::App for DashboardApp {
 
             ui.add_space(8.0);
 
-            // ============================================
-            // الجزء الأيمن: شاشة الـ Live Diagnostic Log
-            // ============================================
+            // الجزء الأيمن: شاشة الـ Log
             ui.vertical(|ui| {
                 ui.set_width(290.0);
 
@@ -591,7 +582,7 @@ impl eframe::App for DashboardApp {
                         }
                         if ui.button("📋 Copy").clicked() {
                             let text: String = LOG_ENTRIES.lock().unwrap().iter().map(|e| format!("[{:06.2}s] {}\n", e.time_s, e.text)).collect();
-                            ui.ctx().output_mut(|o| o.copied_text = text);
+                            ui.ctx().copy_text(text);
                         }
                     });
                 });
