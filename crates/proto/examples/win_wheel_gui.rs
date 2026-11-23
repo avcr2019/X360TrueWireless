@@ -34,9 +34,6 @@ mod btn {
     pub const Y: u16 = 0x8000;
 }
 
-// ----------------------------------------------------
-// وحدة الاتصال المباشر مع درايفر vJoy
-// ----------------------------------------------------
 mod vjoy {
     use super::*;
 
@@ -182,9 +179,7 @@ mod vjoy {
     }
 }
 
-// ----------------------------------------------------
-// نظام المعايرة الذكي وعزل تداخل الإشارات (Crosstalk)
-// ----------------------------------------------------
+// معايرة عزل نقطة الصفر
 #[derive(Clone, Copy)]
 struct PedalCalib {
     rest_baseline: u8,
@@ -203,8 +198,13 @@ impl Default for PedalCalib {
 }
 
 impl PedalCalib {
-    fn process(&mut self, raw: u8) -> f32 {
-        if self.sample_count < 25 {
+    fn process(&mut self, raw: u8, is_connected: bool) -> f32 {
+        if !is_connected {
+            return 0.0;
+        }
+
+        // أخذ عينات وضع الراحة بعد التأكد التام من اتصال الدريكسون
+        if self.sample_count < 20 {
             if self.sample_count == 0 {
                 self.rest_baseline = raw;
             } else {
@@ -214,8 +214,8 @@ impl PedalCalib {
             return 0.0;
         }
 
-        let deadzone_threshold = self.rest_baseline.saturating_add(14);
-        if raw <= deadzone_threshold {
+        let threshold = self.rest_baseline.saturating_add(16);
+        if raw <= threshold {
             return 0.0;
         }
 
@@ -223,12 +223,12 @@ impl PedalCalib {
             self.max_pressed = raw;
         }
 
-        let range = (self.max_pressed.saturating_sub(deadzone_threshold)) as f32;
+        let range = (self.max_pressed.saturating_sub(threshold)) as f32;
         if range < 10.0 {
             return 0.0;
         }
 
-        ((raw - deadzone_threshold) as f32 / range).clamp(0.0, 1.0)
+        ((raw - threshold) as f32 / range).clamp(0.0, 1.0)
     }
 
     fn reset(&mut self) {
@@ -243,8 +243,8 @@ struct WheelState {
     connected: bool,
     vjoy_connected: bool,
     steering: i16,
-    brake_raw: u8,
-    throttle_raw: u8,
+    brake_pct: f32,
+    throttle_pct: f32,
     buttons: u16,
 }
 
@@ -253,6 +253,7 @@ enum FfbCommand {
     Autocenter(u8),
     ConstantForce(i8),
     Rumble(u8, u8),
+    ResetPedals,
 }
 
 fn main() -> eframe::Result<()> {
@@ -289,8 +290,6 @@ struct DashboardApp {
     test_force: f32,
     rumble_strong: u8,
     rumble_weak: u8,
-    brake_calib: PedalCalib,
-    throttle_calib: PedalCalib,
 }
 
 impl DashboardApp {
@@ -303,8 +302,6 @@ impl DashboardApp {
             test_force: 0.0,
             rumble_strong: 0,
             rumble_weak: 0,
-            brake_calib: PedalCalib::default(),
-            throttle_calib: PedalCalib::default(),
         }
     }
 }
@@ -316,9 +313,6 @@ impl eframe::App for DashboardApp {
         ui.painter().rect_filled(ui.max_rect(), CornerRadius::ZERO, Color32::from_rgb(18, 20, 26));
 
         let current = self.state.lock().unwrap().clone();
-
-        let brake_pct = self.brake_calib.process(current.brake_raw);
-        let throttle_pct = self.throttle_calib.process(current.throttle_raw);
 
         ui.add_space(10.0);
 
@@ -370,17 +364,16 @@ impl eframe::App for DashboardApp {
                 ui.set_width(240.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("CALIBRATED PEDALS").color(Color32::GRAY).size(13.0));
-                    if ui.button(egui::RichText::new("↺ Reset Zero").size(10.0)).on_hover_text("اضغط لتثبيت وضع الصفر للدواسات").clicked() {
-                        self.brake_calib.reset();
-                        self.throttle_calib.reset();
+                    if ui.button(egui::RichText::new("↺ Reset Zero").size(10.0)).on_hover_text("اضغط وأنت سايب الدواسات لتثبيت الصفر").clicked() {
+                        let _ = self.tx.send(FfbCommand::ResetPedals);
                     }
                 });
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    draw_pedal(ui, "BRAKE", brake_pct, Color32::from_rgb(255, 59, 48));
+                    draw_pedal(ui, "BRAKE", current.brake_pct, Color32::from_rgb(255, 59, 48));
                     ui.add_space(30.0);
-                    draw_pedal(ui, "THROTTLE", throttle_pct, Color32::from_rgb(52, 199, 89));
+                    draw_pedal(ui, "THROTTLE", current.throttle_pct, Color32::from_rgb(52, 199, 89));
                 });
             });
         });
@@ -602,6 +595,10 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                     FfbCommand::Rumble(strong, weak) => {
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x00, weak, strong, 0, 0, 0, 0, 0]);
                     }
+                    FfbCommand::ResetPedals => {
+                        brake_calib.reset();
+                        throttle_calib.reset();
+                    }
                 }
             }
 
@@ -618,21 +615,21 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         let rt = data[9];
                         let lx = i16::from_le_bytes([data[10], data[11]]);
 
+                        let b_pct = brake_calib.process(lt, true);
+                        let t_pct = throttle_calib.process(rt, true);
+
                         {
                             let mut s = state.lock().unwrap();
                             s.steering = lx;
-                            s.brake_raw = lt;
-                            s.throttle_raw = rt;
+                            s.brake_pct = b_pct;
+                            s.throttle_pct = t_pct;
                             s.buttons = buttons;
                             s.connected = true;
                         }
 
-                        // تغذية vJoy بالحركة في نفس اللحظة
+                        // تغذية vJoy بالحركة الموحدة
                         let vjoy_steering = (((lx as i32 + 32768) as f64 / 65535.0) * 32767.0 + 1.0) as i32;
                         vjoy_dev.set_axis(vjoy::HID_USAGE_X, vjoy_steering.clamp(1, 32768));
-
-                        let b_pct = brake_calib.process(lt);
-                        let t_pct = throttle_calib.process(rt);
 
                         let vjoy_throttle = (t_pct * 32767.0 + 1.0) as i32;
                         vjoy_dev.set_axis(vjoy::HID_USAGE_Y, vjoy_throttle.clamp(1, 32768));
