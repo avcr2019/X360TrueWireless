@@ -2,7 +2,6 @@ name: Build Windows Exe
 
 on:
   push:
-    branches: [ "main", "master", "dev" ]
   workflow_dispatch:
 
 jobs:
@@ -16,13 +15,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Windows Tools
+      - name: Build Windows Test Tool
         run: |
-          cargo build --release --example win_test
-
+          cargo build --release --package x360truewireless-proto --example win_test
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: x360-windows-tools
-          path: target/release/*.exe
+          path: target/release/examples/win_test.exe
