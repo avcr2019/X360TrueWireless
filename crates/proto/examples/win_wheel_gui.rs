@@ -1,11 +1,26 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// ============================================================================
+//  Xbox 360 Wheel Studio & FFB Feeder  -  "Full FFB Engine" edition
+//
+//  اللي اتضاف عن النسخة اللي فاتت:
+//   * الـ Engine بقى بيفهم كل أنواع الـ Effects اللي بتبعتها اللعبة، مش Constant بس:
+//       Constant / Ramp / Square / Sine / Triangle / SawUp / SawDown   (مطبات + اهتزاز الأرض + الكيربات)
+//       Spring / Damper / Friction                                       (ثقل الدريكسيون + رجوع للمنتصف)
+//       + Envelope (Attack / Fade) + Loop Count + Gain لكل Effect
+//   * Mixer بيحسب القوة النهائية كل ~8ms ويبعتها للدريكسيون بسرعة أعلى (قابلة للتعديل)
+//   * "Impact Detail" بيكبّر بداية أي خبطة / نزلة من فوق مطب
+//   * شريط بيوريك اللعبة بتستخدم أنهي Effects فعلاً (لو SINE/SQR مش منوّرين -> اللعبة مش بتبعتهم)
+//   * Detect Motor Direction عشان الـ Spring/Damper يشتغلوا في الاتجاه الصح مهما كان توصيل الموتور
+//   * (تجريبي) طبقة Rumble لو الدريكسيون بيستجيب لأوامر الاهتزاز
+// ============================================================================
+
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use nusb::transfer::{Buffer, In, Interrupt, Out};
 use nusb::MaybeFuture;
 use std::ffi::c_void;
 use std::f32::consts::PI;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -42,33 +57,169 @@ fn add_log(text: impl Into<String>, color: Color32) {
 }
 
 // ============================================================================
-//  FFB ENGINE
-//  بدل ما كنا بنحتفظ بقيمة واحدة (magnitude) بقينا بنتتبع كل Effect لوحده
-//  (Create / Start / Stop / Duration / Free / Device-Control) زي الدريكسيون الأصلي.
+//  FFB ENGINE  (كل Effect بيتتبع لوحده + Mixer بيجمعهم)
 // ============================================================================
 const MAX_EFFECTS: usize = 64;
-const ET_CONST: u32 = 1; // FFBEType::ET_CONST في vJoy
 const COL_DBG: Color32 = Color32::from_rgb(150, 150, 255);
+
+// FFBEType في vJoy
+const ET_CONST: u32 = 1;
+const ET_RAMP: u32 = 2;
+const ET_SQR: u32 = 3;
+const ET_SINE: u32 = 4;
+const ET_TRNGL: u32 = 5;
+const ET_STUP: u32 = 6;
+const ET_STDN: u32 = 7;
+const ET_SPRNG: u32 = 8;
+const ET_DMPR: u32 = 9;
+const ET_INRT: u32 = 10;
+const ET_FRCTN: u32 = 11;
+const ET_CSTM: u32 = 12;
+
+/// أقصى سرعة لف (بوحدة: المدى الكامل للدريكسيون في الثانية) بتتحسب عندها قوة الـ Damper 100%
+const DAMPER_FULL_VEL: f32 = 3.0;
+/// السرعة اللي عندها الـ Friction توصل 100%
+const FRICTION_FULL_VEL: f32 = 0.25;
+
+fn etype_name(t: u32) -> &'static str {
+    match t {
+        ET_CONST => "CONSTANT",
+        ET_RAMP => "RAMP",
+        ET_SQR => "SQUARE",
+        ET_SINE => "SINE",
+        ET_TRNGL => "TRIANGLE",
+        ET_STUP => "SAW-UP",
+        ET_STDN => "SAW-DOWN",
+        ET_SPRNG => "SPRING",
+        ET_DMPR => "DAMPER",
+        ET_INRT => "INERTIA",
+        ET_FRCTN => "FRICTION",
+        ET_CSTM => "CUSTOM",
+        _ => "?",
+    }
+}
+
+fn is_periodic(t: u32) -> bool {
+    (ET_SQR..=ET_STDN).contains(&t)
+}
+
+fn is_condition(t: u32) -> bool {
+    (ET_SPRNG..=ET_FRCTN).contains(&t)
+}
+
+#[allow(clippy::declare_interior_mutable_const)]
+const ATOMIC_ZERO: AtomicU32 = AtomicU32::new(0);
+/// عداد: كام مرة اللعبة بعتت Effect من كل نوع (بيتعرض في الواجهة)
+static EFFECT_SEEN: [AtomicU32; 13] = [ATOMIC_ZERO; 13];
+/// عداد الباكتات اللي اتبعتت فعلاً للدريكسيون (عشان نعرض pkt/s)
+static SENT_PKTS: AtomicU32 = AtomicU32::new(0);
+
+fn note_effect_seen(t: u32) {
+    let i = t as usize;
+    if i < EFFECT_SEEN.len() && EFFECT_SEEN[i].fetch_add(1, Ordering::Relaxed) == 0 {
+        add_log(
+            format!("🎮 Game is using effect type: {}", etype_name(t)),
+            Color32::from_rgb(0, 230, 118),
+        );
+    }
+}
+
+/// إعدادات بتتعدل من الواجهة وبتتقري في الـ worker كل لفة
+#[derive(Clone, Copy)]
+struct Tuning {
+    vib_gain: f32,      // تكبير الاهتزاز (Periodic effects: مطبات / كيربات / رصيف)
+    detail: f32,        // تكبير بداية الخبطات
+    cond_on: bool,      // Spring / Damper / Friction
+    cond_gain: f32,
+    rumble_layer: bool, // تجريبي
+    send_ms: u32,       // أقل فاصل بين باكتين للدريكسيون
+}
+
+impl Tuning {
+    const DEFAULT: Tuning = Tuning {
+        vib_gain: 1.5,
+        detail: 0.6,
+        cond_on: true,
+        cond_gain: 0.7,
+        rumble_layer: false,
+        send_ms: 8,
+    };
+}
+
+static TUNE: Mutex<Tuning> = Mutex::new(Tuning::DEFAULT);
 
 #[derive(Clone, Copy)]
 struct Effect {
-    is_const: bool,         // وصلنا له Constant-Force report
-    running: bool,          // اللعبة عملت Start
-    magnitude: i32,         // -10000..10000
-    duration_ms: u32,       // 0 = للأبد
+    etype: u32,          // FFBEType (0 = لسه مش معروف)
+    running: bool,       // اللعبة عملت Start
     started: Option<Instant>,
-    dir_factor: f32,        // إسقاط اتجاه الـ effect على محور الدريكسيون (-1..1)
+    duration_ms: u32,    // 0 = للأبد
+    loops: u32,          // Loop count (0/1 = مرة، 255 = للأبد)
+    gain: f32,           // Gain الخاص بالـ effect (0..1)
+    dir_factor: f32,     // إسقاط اتجاه الـ effect على محور الدريكسيون (-1..1)
+    // Constant
+    magnitude: i32,      // -10000..10000
+    // Ramp
+    ramp_start: i32,
+    ramp_end: i32,
+    // Periodic
+    p_mag: u32,          // 0..10000
+    p_offset: i32,       // -10000..10000
+    p_phase: u32,        // درجات
+    p_period: u32,       // ms
+    // Envelope
+    has_env: bool,
+    atk_level: u32,
+    fade_level: u32,
+    atk_time: u32,
+    fade_time: u32,
+    // Condition (محور X بس)
+    has_cond: bool,
+    c_center: i32,
+    c_pos_coeff: i32,
+    c_neg_coeff: i32,
+    c_pos_sat: u32,
+    c_neg_sat: u32,
+    c_dead: i32,
 }
 
 impl Effect {
     const EMPTY: Effect = Effect {
-        is_const: false,
+        etype: 0,
         running: false,
-        magnitude: 0,
-        duration_ms: 0,
         started: None,
+        duration_ms: 0,
+        loops: 1,
+        gain: 1.0,
         dir_factor: 1.0,
+        magnitude: 0,
+        ramp_start: 0,
+        ramp_end: 0,
+        p_mag: 0,
+        p_offset: 0,
+        p_phase: 0,
+        p_period: 100,
+        has_env: false,
+        atk_level: 0,
+        fade_level: 0,
+        atk_time: 0,
+        fade_time: 0,
+        has_cond: false,
+        c_center: 0,
+        c_pos_coeff: 0,
+        c_neg_coeff: 0,
+        c_pos_sat: 10000,
+        c_neg_sat: 10000,
+        c_dead: 0,
     };
+
+    /// المدة الكلية بالمللي ثانية (None = للأبد)
+    fn total_ms(&self) -> Option<f64> {
+        if self.duration_ms == 0 || self.loops >= 255 {
+            return None;
+        }
+        Some(self.duration_ms as f64 * self.loops.max(1) as f64)
+    }
 }
 
 struct FfbState {
@@ -87,7 +238,7 @@ static FFB: Mutex<FfbState> = Mutex::new(FfbState {
 
 static FFB_DEBUG: AtomicBool = AtomicBool::new(true);
 static SEEN_EFOP: AtomicBool = AtomicBool::new(false);
-static DBG_LAST: Mutex<[Option<Instant>; 8]> = Mutex::new([None; 8]);
+static DBG_LAST: Mutex<[Option<Instant>; 12]> = Mutex::new([None; 12]);
 
 /// Rate-limiter للوج عشان اللوج ما يتملاش بالـ 60 باكت في الثانية
 fn dbg_allowed(slot: usize, min_ms: u64) -> bool {
@@ -102,35 +253,198 @@ fn dbg_allowed(slot: usize, min_ms: u64) -> bool {
     ok
 }
 
-/// مجموع قوى كل الـ Constant effects الشغالة حالياً (-1..1)، أو None لو مفيش ولا واحد شغال.
-fn ffb_total_force() -> Option<f32> {
+/// في الوضع القديم (لسه ما جاش EffectOp من اللعبة) أي effect بيوصله بيانات يشتغل فوراً
+fn legacy_autostart(e: &mut Effect) {
+    if !SEEN_EFOP.load(Ordering::Relaxed) && !e.running {
+        e.running = true;
+        e.started = Some(Instant::now());
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Mixer
+// ---------------------------------------------------------------------------
+#[derive(Clone, Copy, Default)]
+struct FfbMix {
+    /// Constant + Ramp + Periodic. بنفس اتجاه DirectInput (بيعدّي على Invert)
+    di: f32,
+    /// Spring / Damper / Friction. بالاتجاه الفيزيائي (موجب = ناحية +steering)
+    phys: f32,
+    /// "طاقة" الاهتزاز 0..1 (للـ Rumble layer)
+    vib: f32,
+    active: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RenderParams {
+    pos: f32, // -1..1
+    vel: f32, // وحدات/ثانية (المدى الكامل = 2.0)
+    vib_gain: f32,
+    cond_on: bool,
+    cond_gain: f32,
+}
+
+/// شكل الموجة: ph من 0..1
+fn wave(t: u32, p: f32) -> f32 {
+    match t {
+        ET_SQR => {
+            if p < 0.5 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        ET_SINE => (p * 2.0 * PI).sin(),
+        ET_TRNGL => {
+            if p < 0.25 {
+                4.0 * p
+            } else if p < 0.75 {
+                2.0 - 4.0 * p
+            } else {
+                4.0 * p - 4.0
+            }
+        }
+        ET_STUP => 2.0 * p - 1.0,
+        ET_STDN => 1.0 - 2.0 * p,
+        _ => 0.0,
+    }
+}
+
+/// Envelope: بيعدّل "حجم" الـ effect (amp >= 0) بحسب Attack / Fade
+fn envelope_amp(e: &Effect, amp: f32, t_ms: f64, total_ms: Option<f64>) -> f32 {
+    if !e.has_env {
+        return amp;
+    }
+    let mut a = amp;
+    if e.atk_time > 0 && t_ms < e.atk_time as f64 {
+        let atk = e.atk_level as f32 / 10000.0;
+        let k = (t_ms / e.atk_time as f64) as f32;
+        a = atk + (amp - atk) * k;
+    }
+    if let Some(total) = total_ms {
+        if e.fade_time > 0 {
+            let fade_start = total - e.fade_time as f64;
+            if t_ms > fade_start {
+                let fade = e.fade_level as f32 / 10000.0;
+                let k = (((t_ms - fade_start) / e.fade_time as f64) as f32).clamp(0.0, 1.0);
+                a += (fade - a) * k;
+            }
+        }
+    }
+    a.max(0.0)
+}
+
+fn sat_of(s: u32) -> f32 {
+    if s == 0 {
+        1.0
+    } else {
+        (s as f32 / 10000.0).min(1.0)
+    }
+}
+
+/// Spring / Damper / Friction (بالاتجاه الفيزيائي: موجب = ناحية +steering)
+fn cond_force(t: u32, e: &Effect, pos: f32, vel: f32) -> f32 {
+    match t {
+        ET_SPRNG => {
+            let cp = e.c_center as f32 / 10000.0;
+            let db = (e.c_dead as f32 / 10000.0).abs();
+            let x = pos - cp;
+            if x > db {
+                let s = sat_of(e.c_pos_sat);
+                (-(e.c_pos_coeff as f32 / 10000.0) * (x - db)).clamp(-s, s)
+            } else if x < -db {
+                let s = sat_of(e.c_neg_sat);
+                (-(e.c_neg_coeff as f32 / 10000.0) * (x + db)).clamp(-s, s)
+            } else {
+                0.0
+            }
+        }
+        ET_DMPR | ET_FRCTN => {
+            let full = if t == ET_DMPR { DAMPER_FULL_VEL } else { FRICTION_FULL_VEL };
+            let v = (vel / full).clamp(-1.0, 1.0);
+            let (c, s) = if v >= 0.0 {
+                (e.c_pos_coeff, sat_of(e.c_pos_sat))
+            } else {
+                (e.c_neg_coeff, sat_of(e.c_neg_sat))
+            };
+            (-(c as f32 / 10000.0) * v).clamp(-s, s)
+        }
+        _ => 0.0,
+    }
+}
+
+/// بيجمع كل الـ Effects الشغالة دلوقتي. None = مفيش ولا Effect شغال.
+fn ffb_render(rp: &RenderParams) -> Option<FfbMix> {
     let mut s = FFB.lock().unwrap();
     if !s.actuators_on || s.paused {
         return None;
     }
-    let mut sum = 0.0f32;
-    let mut any = false;
+    let dev = s.device_gain as f32 / 255.0;
+    let now = Instant::now();
+    let mut mix = FfbMix::default();
+
     for e in s.effects.iter_mut() {
-        if !(e.is_const && e.running) {
+        if !e.running || e.etype == 0 {
             continue;
         }
+        let t0 = *e.started.get_or_insert(now);
+        let t_ms = now.duration_since(t0).as_secs_f64() * 1000.0;
+        let total = e.total_ms();
+
         // Effect له مدة محددة (زي صدمة الحيطة): الجهاز هو اللي لازم يوقفه لما المدة تخلص
-        if e.duration_ms != 0 {
-            if let Some(t0) = e.started {
-                if t0.elapsed() >= Duration::from_millis(e.duration_ms as u64) {
-                    e.running = false;
-                    continue;
-                }
+        if let Some(tot) = total {
+            if t_ms >= tot {
+                e.running = false;
+                continue;
             }
         }
-        any = true;
-        sum += (e.magnitude as f32 / 10000.0) * e.dir_factor;
+        mix.active = true;
+
+        match e.etype {
+            ET_CONST => {
+                let m = e.magnitude as f32 / 10000.0;
+                let a = envelope_amp(e, m.abs(), t_ms, total);
+                mix.di += a * m.signum() * e.gain * e.dir_factor;
+            }
+            ET_RAMP => {
+                let k = if e.duration_ms > 0 {
+                    let d = e.duration_ms as f64;
+                    ((t_ms % d) / d) as f32
+                } else {
+                    0.0
+                };
+                let v = e.ramp_start as f32 + (e.ramp_end as f32 - e.ramp_start as f32) * k;
+                mix.di += (v / 10000.0) * e.gain * e.dir_factor;
+            }
+            t if is_periodic(t) => {
+                let period = e.p_period.max(1) as f64;
+                let ph = ((t_ms / period) + e.p_phase as f64 / 360.0).fract() as f32;
+                // الجهاز بيتحدّث ~125 مرة في الثانية، فالترددات العالية جداً بنقلل منها شوية
+                let freq = 1000.0 / period as f32;
+                let att = if freq > 45.0 { (45.0 / freq).max(0.35) } else { 1.0 };
+                let amp = envelope_amp(e, e.p_mag as f32 / 10000.0, t_ms, total);
+                let osc = amp * wave(t, ph) * att;
+                let off = e.p_offset as f32 / 10000.0;
+                let k = e.gain * e.dir_factor;
+                mix.di += (off + osc * rp.vib_gain) * k;
+                mix.vib += (osc * e.gain).abs();
+            }
+            t if is_condition(t) => {
+                if rp.cond_on && e.has_cond {
+                    mix.phys += cond_force(t, e, rp.pos, rp.vel) * e.gain * rp.cond_gain;
+                }
+            }
+            _ => {}
+        }
     }
-    if !any {
+
+    if !mix.active {
         return None;
     }
-    let dev = s.device_gain as f32 / 255.0;
-    Some((sum * dev).clamp(-1.0, 1.0))
+    mix.di *= dev;
+    mix.phys *= dev;
+    mix.vib *= dev;
+    Some(mix)
 }
 
 mod btn {
@@ -181,17 +495,21 @@ mod vjoy {
     pub const HID_USAGE_RZ: UINT = 0x35;
 
     // أنواع باكتات الـ FFB (FFBPType = رقم الـ HID PID report)
-    const PT_EFFREP: u32 = 0x01;
-    const PT_CONSTREP: u32 = 0x05;
-    const PT_EFOPREP: u32 = 0x0A;
-    const PT_BLKFRREP: u32 = 0x0B;
-    const PT_CTRLREP: u32 = 0x0C;
-    const PT_GAINREP: u32 = 0x0D;
-    // أنواع معروفة بس مش بندعمها حالياً (Envelope / Condition / Periodic / Ramp / Custom / ...)
-    const PT_IGNORED: [u32; 10] = [0x02, 0x03, 0x04, 0x06, 0x07, 0x08, 0x0E, 0x11, 0x12, 0x13];
+    const PT_EFFREP: u32 = 0x01; // Set Effect
+    const PT_ENVREP: u32 = 0x02; // Envelope
+    const PT_CONDREP: u32 = 0x03; // Condition (Spring / Damper / Friction / Inertia)
+    const PT_PRIDREP: u32 = 0x04; // Periodic (Sine / Square / ...)
+    const PT_CONSTREP: u32 = 0x05; // Constant Force
+    const PT_RAMPREP: u32 = 0x06; // Ramp
+    const PT_EFOPREP: u32 = 0x0A; // Effect Operation
+    const PT_BLKFRREP: u32 = 0x0B; // Block Free
+    const PT_CTRLREP: u32 = 0x0C; // Device Control
+    const PT_GAINREP: u32 = 0x0D; // Device Gain
+    // أنواع معروفة بس مش محتاجينها (Custom data / New effect / Block load / Pool)
+    const PT_IGNORED: [u32; 6] = [0x07, 0x08, 0x0E, 0x11, 0x12, 0x13];
 
-    // ملحوظة: الـ structs دي بتطابق vJoy SDK، وزودنا _tail احتياطي عشان لو الحجم الحقيقي أكبر
-    // ما يحصلش كتابة خارج الـ buffer.
+    // ملحوظة: الـ structs دي بتطابق vJoy SDK (محاذاة 4 bytes)، وزودنا _tail احتياطي عشان لو الحجم
+    // الحقيقي أكبر ما يحصلش كتابة خارج الـ buffer.
     #[repr(C)]
     #[derive(Default, Clone, Copy)]
     #[allow(dead_code)]
@@ -199,6 +517,59 @@ mod vjoy {
         pub effect_block_index: u8,
         pub _pad: [u8; 3],
         pub magnitude: i32,
+        pub _tail: [u8; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    #[allow(dead_code)]
+    pub struct FfbEffRamp {
+        pub effect_block_index: u8,
+        pub _pad: [u8; 3],
+        pub start: i32,
+        pub end: i32,
+        pub _tail: [u8; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    #[allow(dead_code)]
+    pub struct FfbEffPeriod {
+        pub effect_block_index: u8,
+        pub _pad: [u8; 3],
+        pub magnitude: u32,
+        pub offset: i32,
+        pub phase: u32,
+        pub period: u32,
+        pub _tail: [u8; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    #[allow(dead_code)]
+    pub struct FfbEffCond {
+        pub effect_block_index: u8,
+        pub _pad: [u8; 3],
+        pub is_y: i32,
+        pub center_offset: i32,
+        pub pos_coeff: i32,
+        pub neg_coeff: i32,
+        pub pos_satur: u32,
+        pub neg_satur: u32,
+        pub dead_band: i32,
+        pub _tail: [u8; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    #[allow(dead_code)]
+    pub struct FfbEffEnvlp {
+        pub effect_block_index: u8,
+        pub _pad: [u8; 3],
+        pub attack_level: u32,
+        pub fade_level: u32,
+        pub attack_time: u32,
+        pub fade_time: u32,
         pub _tail: [u8; 8],
     }
 
@@ -249,11 +620,22 @@ mod vjoy {
     pub type FnFfbU32 = unsafe extern "system" fn(*const c_void, *mut u32) -> u32;
     pub type FnFfbEffReport = unsafe extern "system" fn(*const c_void, *mut FfbEffReport) -> u32;
     pub type FnFfbEffConstant = unsafe extern "system" fn(*const c_void, *mut FfbEffConstant) -> u32;
+    pub type FnFfbEffRamp = unsafe extern "system" fn(*const c_void, *mut FfbEffRamp) -> u32;
+    pub type FnFfbEffPeriod = unsafe extern "system" fn(*const c_void, *mut FfbEffPeriod) -> u32;
+    pub type FnFfbEffCond = unsafe extern "system" fn(*const c_void, *mut FfbEffCond) -> u32;
+    pub type FnFfbEffEnvlp = unsafe extern "system" fn(*const c_void, *mut FfbEffEnvlp) -> u32;
     pub type FnFfbEffOp = unsafe extern "system" fn(*const c_void, *mut FfbEffOp) -> u32;
 
     unsafe extern "system" {
         fn LoadLibraryA(lpLibFileName: *const u8) -> *mut c_void;
         fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
+    }
+
+    /// "name\0" كـ &[u8]
+    macro_rules! cs {
+        ($s:expr) => {
+            concat!($s, "\0").as_bytes()
+        };
     }
 
     #[derive(Clone, Copy, Default)]
@@ -262,6 +644,10 @@ mod vjoy {
         pub ebi: Option<FnFfbU32>,
         pub eff_report: Option<FnFfbEffReport>,
         pub eff_const: Option<FnFfbEffConstant>,
+        pub eff_ramp: Option<FnFfbEffRamp>,
+        pub eff_period: Option<FnFfbEffPeriod>,
+        pub eff_cond: Option<FnFfbEffCond>,
+        pub eff_envlp: Option<FnFfbEffEnvlp>,
         pub eff_op: Option<FnFfbEffOp>,
         pub dev_ctrl: Option<FnFfbU32>,
         pub dev_gain: Option<FnFfbU32>,
@@ -308,37 +694,75 @@ mod vjoy {
         let ebi: Option<usize> = unsafe { call_u32(f.ebi, p_packet) }.map(slot_index);
 
         match ptype {
-            // ---------- Set Effect Report: المدة + الاتجاه ----------
+            // ---------- Set Effect Report: النوع + المدة + الاتجاه + الـ Gain ----------
             PT_EFFREP => {
                 let Some(fr) = f.eff_report else { return; };
                 let mut rep = FfbEffReport::default();
                 if unsafe { fr(p_packet, &mut rep) } != 0 {
                     return;
                 }
-                // لو النوع مش Constant ما نصدقش باقي الحقول (حماية من اختلاف شكل الـ struct)
-                if rep.effect_type != ET_CONST {
+                let t = rep.effect_type;
+                // لو النوع مش منطقي ما نصدقش باقي الحقول (حماية من اختلاف شكل الـ struct)
+                if t == 0 || t > ET_CSTM {
                     if dbg_allowed(0, 400) {
                         add_log(
-                            format!("FFB EffReport #{}: type={} (not constant -> ignored)", rep.effect_block_index, rep.effect_type),
+                            format!("FFB EffReport #{}: bad type={} -> ignored", rep.effect_block_index, t),
                             COL_DBG,
                         );
                     }
                     return;
                 }
+                note_effect_seen(t);
                 let idx = slot_index(rep.effect_block_index as u32);
                 let polar = rep.polar != 0;
                 let factor = dir_factor(polar, rep.direction, rep.dir_y);
                 let dur = if rep.duration == 0 || rep.duration >= 32767 { 0 } else { rep.duration as u32 };
+                // Gain = 0 غالباً معناها إن الـ struct اتقرا غلط، فبنعتبره 100%
+                let gain = if rep.gain == 0 { 1.0 } else { rep.gain as f32 / 255.0 };
                 {
                     let mut s = FFB.lock().unwrap();
-                    s.effects[idx].duration_ms = dur;
-                    s.effects[idx].dir_factor = factor;
+                    let e = &mut s.effects[idx];
+                    e.etype = t;
+                    e.duration_ms = dur;
+                    e.dir_factor = factor;
+                    e.gain = gain;
                 }
                 if dbg_allowed(0, 100) {
                     add_log(
                         format!(
-                            "FFB EffReport #{}: CONST dur={}ms polar={} dir={} dirY={} -> X factor {:+.2}",
-                            idx, dur, polar, rep.direction, rep.dir_y, factor
+                            "FFB EffReport #{}: {} dur={}ms gain={} polar={} dir={} dirY={} -> X factor {:+.2}",
+                            idx, etype_name(t), dur, rep.gain, polar, rep.direction, rep.dir_y, factor
+                        ),
+                        COL_DBG,
+                    );
+                }
+            }
+
+            // ---------- Envelope: Attack / Fade ----------
+            PT_ENVREP => {
+                let Some(fe) = f.eff_envlp else { return; };
+                let mut en = FfbEffEnvlp::default();
+                if unsafe { fe(p_packet, &mut en) } != 0 {
+                    return;
+                }
+                if en.attack_level > 20000 || en.fade_level > 20000 || en.attack_time > 40000 || en.fade_time > 40000 {
+                    return;
+                }
+                let idx = slot_index(en.effect_block_index as u32);
+                {
+                    let mut s = FFB.lock().unwrap();
+                    let e = &mut s.effects[idx];
+                    e.has_env = true;
+                    e.atk_level = en.attack_level;
+                    e.fade_level = en.fade_level;
+                    e.atk_time = en.attack_time;
+                    e.fade_time = en.fade_time;
+                }
+                if dbg_allowed(10, 300) {
+                    add_log(
+                        format!(
+                            "FFB Envelope #{}: attack {}@{}ms  fade {}@{}ms",
+                            idx, en.attack_level, en.attack_time, en.fade_level, en.fade_time
                         ),
                         COL_DBG,
                     );
@@ -362,15 +786,119 @@ mod vjoy {
                 {
                     let mut s = FFB.lock().unwrap();
                     let e = &mut s.effects[idx];
-                    e.is_const = true;
-                    e.magnitude = c.magnitude;
-                    // لو لسه ما جاش ولا EffectOp من اللعبة، اشتغل بالطريقة القديمة (شغال فوراً)
-                    if !SEEN_EFOP.load(Ordering::Relaxed) {
-                        e.running = true;
+                    if e.etype == 0 {
+                        e.etype = ET_CONST;
                     }
+                    e.magnitude = c.magnitude;
+                    legacy_autostart(e);
                 }
                 if dbg_allowed(1, 200) {
                     add_log(format!("FFB Const #{}: magnitude={:+}", idx, c.magnitude), COL_DBG);
+                }
+            }
+
+            // ---------- Ramp ----------
+            PT_RAMPREP => {
+                let Some(fr) = f.eff_ramp else { return; };
+                let mut r = FfbEffRamp::default();
+                if unsafe { fr(p_packet, &mut r) } != 0 {
+                    return;
+                }
+                if r.start.abs() > 10000 || r.end.abs() > 10000 {
+                    return;
+                }
+                let idx = slot_index(r.effect_block_index as u32);
+                {
+                    let mut s = FFB.lock().unwrap();
+                    let e = &mut s.effects[idx];
+                    if e.etype == 0 {
+                        e.etype = ET_RAMP;
+                    }
+                    e.ramp_start = r.start;
+                    e.ramp_end = r.end;
+                    legacy_autostart(e);
+                }
+                if dbg_allowed(9, 200) {
+                    add_log(format!("FFB Ramp #{}: {:+} -> {:+}", idx, r.start, r.end), COL_DBG);
+                }
+            }
+
+            // ---------- Periodic: Sine / Square / Triangle / Saw (مطبات واهتزازات) ----------
+            PT_PRIDREP => {
+                let Some(fp) = f.eff_period else { return; };
+                let mut p = FfbEffPeriod::default();
+                if unsafe { fp(p_packet, &mut p) } != 0 {
+                    return;
+                }
+                if p.magnitude > 20000 || p.offset.abs() > 20000 {
+                    return;
+                }
+                let idx = slot_index(p.effect_block_index as u32);
+                {
+                    let mut s = FFB.lock().unwrap();
+                    let e = &mut s.effects[idx];
+                    if e.etype == 0 {
+                        e.etype = ET_SINE; // لحد ما يجي EffectReport بالنوع الحقيقي
+                    }
+                    e.p_mag = p.magnitude.min(10000);
+                    e.p_offset = p.offset.clamp(-10000, 10000);
+                    e.p_phase = p.phase;
+                    e.p_period = p.period.clamp(1, 32767);
+                    legacy_autostart(e);
+                }
+                if dbg_allowed(7, 150) {
+                    add_log(
+                        format!(
+                            "FFB Periodic #{}: mag={} offset={:+} period={}ms (~{:.0}Hz) phase={}",
+                            idx,
+                            p.magnitude,
+                            p.offset,
+                            p.period,
+                            1000.0 / p.period.max(1) as f32,
+                            p.phase
+                        ),
+                        COL_DBG,
+                    );
+                }
+            }
+
+            // ---------- Condition: Spring / Damper / Friction ----------
+            PT_CONDREP => {
+                let Some(fc) = f.eff_cond else { return; };
+                let mut c = FfbEffCond::default();
+                if unsafe { fc(p_packet, &mut c) } != 0 {
+                    return;
+                }
+                if c.is_y != 0 {
+                    return; // الدريكسيون محور X بس
+                }
+                if c.pos_coeff.abs() > 20000 || c.neg_coeff.abs() > 20000 || c.center_offset.abs() > 20000 {
+                    return;
+                }
+                let idx = slot_index(c.effect_block_index as u32);
+                {
+                    let mut s = FFB.lock().unwrap();
+                    let e = &mut s.effects[idx];
+                    if e.etype == 0 {
+                        e.etype = ET_SPRNG;
+                    }
+                    e.has_cond = true;
+                    e.c_center = c.center_offset.clamp(-10000, 10000);
+                    e.c_pos_coeff = c.pos_coeff.clamp(-10000, 10000);
+                    e.c_neg_coeff = c.neg_coeff.clamp(-10000, 10000);
+                    e.c_pos_sat = c.pos_satur.min(10000);
+                    e.c_neg_sat = c.neg_satur.min(10000);
+                    e.c_dead = c.dead_band.clamp(0, 10000);
+                    legacy_autostart(e);
+                }
+                if dbg_allowed(8, 300) {
+                    add_log(
+                        format!(
+                            "FFB Condition #{}: cp={:+} coeff=+{}/{} sat={}/{} dead={}",
+                            idx, c.center_offset, c.pos_coeff, c.neg_coeff, c.pos_satur, c.neg_satur, c.dead_band
+                        ),
+                        COL_DBG,
+                    );
                 }
             }
 
@@ -390,12 +918,14 @@ mod vjoy {
                             let e = &mut s.effects[idx];
                             e.running = true;
                             e.started = Some(Instant::now());
+                            e.loops = op.loop_count as u32;
                         }
                         2 => {
                             for (i, e) in s.effects.iter_mut().enumerate() {
                                 if i == idx {
                                     e.running = true;
                                     e.started = Some(Instant::now());
+                                    e.loops = op.loop_count as u32;
                                 } else {
                                     e.running = false;
                                 }
@@ -414,7 +944,11 @@ mod vjoy {
                         3 => "STOP",
                         _ => "?",
                     };
-                    add_log(format!("FFB EffOp #{}: {}", idx, name), COL_DBG);
+                    let ty = FFB.lock().unwrap().effects[idx].etype;
+                    add_log(
+                        format!("FFB EffOp #{} ({}): {} loops={}", idx, etype_name(ty), name, op.loop_count),
+                        COL_DBG,
+                    );
                 }
             }
 
@@ -452,7 +986,7 @@ mod vjoy {
                         _ => {}
                     }
                 }
-                if dbg_allowed(4, 50) {
+                if dbg_allowed(5, 50) {
                     let name = match code {
                         1 => "ENABLE actuators",
                         2 => "DISABLE actuators",
@@ -470,7 +1004,7 @@ mod vjoy {
             PT_GAINREP => {
                 if let Some(g) = unsafe { call_u32(f.dev_gain, p_packet) } {
                     FFB.lock().unwrap().device_gain = (g & 0xFF) as u8;
-                    if dbg_allowed(4, 200) {
+                    if dbg_allowed(6, 200) {
                         add_log(format!("FFB DeviceGain = {}", g & 0xFF), COL_DBG);
                     }
                 }
@@ -486,7 +1020,7 @@ mod vjoy {
                         let idx = slot_index(c.effect_block_index as u32);
                         let mut s = FFB.lock().unwrap();
                         let e = &mut s.effects[idx];
-                        e.is_const = true;
+                        e.etype = ET_CONST;
                         e.magnitude = c.magnitude;
                         e.running = true;
                     }
@@ -553,6 +1087,16 @@ mod vjoy {
 
             unsafe {
                 let get_fn = |name: &[u8]| -> *mut c_void { GetProcAddress(h_mod, name.as_ptr()) };
+                // بيجرب كذا اسم للدالة (اختلاف بسيط بين نسخ vJoyInterface.dll)
+                let get_any = |names: &[&[u8]]| -> *mut c_void {
+                    for n in names {
+                        let p = GetProcAddress(h_mod, n.as_ptr());
+                        if !p.is_null() {
+                            return p;
+                        }
+                    }
+                    std::ptr::null_mut()
+                };
 
                 let fn_enabled: Option<FnVJoyEnabled> = std::mem::transmute(get_fn(b"vJoyEnabled\0"));
                 vjoy.p_status = std::mem::transmute(get_fn(b"GetVJDStatus\0"));
@@ -568,7 +1112,15 @@ mod vjoy {
                 vjoy.ffb_fns.packet_type = std::mem::transmute(get_fn(b"Ffb_h_Type\0"));
                 vjoy.ffb_fns.ebi = std::mem::transmute(get_fn(b"Ffb_h_EBI\0"));
                 vjoy.ffb_fns.eff_report = std::mem::transmute(get_fn(b"Ffb_h_Eff_Report\0"));
-                vjoy.ffb_fns.eff_const = std::mem::transmute(get_fn(b"Ffb_h_Eff_Constant\0"));
+                vjoy.ffb_fns.eff_const =
+                    std::mem::transmute(get_any(&[cs!("Ffb_h_Eff_Constant"), cs!("Ffb_h_Eff_Const")]));
+                vjoy.ffb_fns.eff_ramp = std::mem::transmute(get_any(&[cs!("Ffb_h_Eff_Ramp")]));
+                vjoy.ffb_fns.eff_period =
+                    std::mem::transmute(get_any(&[cs!("Ffb_h_Eff_Period"), cs!("Ffb_h_Eff_Periodic")]));
+                vjoy.ffb_fns.eff_cond =
+                    std::mem::transmute(get_any(&[cs!("Ffb_h_Eff_Cond"), cs!("Ffb_h_Eff_Condition")]));
+                vjoy.ffb_fns.eff_envlp =
+                    std::mem::transmute(get_any(&[cs!("Ffb_h_Eff_Envlp"), cs!("Ffb_h_Eff_Envelope")]));
                 vjoy.ffb_fns.eff_op = std::mem::transmute(get_fn(b"Ffb_h_EffOp\0"));
                 vjoy.ffb_fns.dev_ctrl = std::mem::transmute(get_fn(b"Ffb_h_DevCtrl\0"));
                 vjoy.ffb_fns.dev_gain = std::mem::transmute(get_fn(b"Ffb_h_DevGain\0"));
@@ -583,6 +1135,29 @@ mod vjoy {
                 {
                     add_log(
                         "vJoyInterface.dll is missing some Ffb_h_* helpers -> basic FFB fallback mode",
+                        Color32::from_rgb(255, 171, 0),
+                    );
+                }
+
+                // لو أي helper للـ effects الجديدة ناقص، نقول للمستخدم بالاسم
+                let mut missing: Vec<&str> = Vec::new();
+                if f.eff_period.is_none() {
+                    missing.push("Periodic (bumps/vibration)");
+                }
+                if f.eff_cond.is_none() {
+                    missing.push("Condition (spring/damper/friction)");
+                }
+                if f.eff_ramp.is_none() {
+                    missing.push("Ramp");
+                }
+                if f.eff_envlp.is_none() {
+                    missing.push("Envelope");
+                }
+                if missing.is_empty() {
+                    add_log("All FFB helpers found (Constant, Ramp, Periodic, Condition, Envelope)", Color32::from_rgb(0, 229, 255));
+                } else {
+                    add_log(
+                        format!("vJoyInterface.dll has no helper for: {}", missing.join(", ")),
                         Color32::from_rgb(255, 171, 0),
                     );
                 }
@@ -739,6 +1314,8 @@ struct WheelState {
     throttle_pct: f32,
     buttons: u16,
     game_ffb_force: f32,
+    /// 0 = لسه ما اتفحصش (بنفترض الوضع الطبيعي)، 1 = قوة موجبة بتلف ناحية +steering، -1 = العكس
+    polarity: i8,
 }
 
 #[allow(dead_code)]
@@ -754,12 +1331,18 @@ enum FfbCommand {
     SweepRight,
     SweepLeft,
     SweepEnd,
+    DetectPolarity,
     Shutdown,
 }
 
 /// باكت القوة الثابتة (force: -127..127)
 fn force_pkt(force: i8) -> [u8; 12] {
     [0x00, 0x01, 0x0f, 0xc0, 0x08, 0x01, force as u8, 0, 0, 0, 0, 0]
+}
+
+/// باكت الاهتزاز (Rumble)
+fn rumble_pkt(a: u8, b: u8) -> [u8; 12] {
+    [0x00, 0x01, 0x0f, 0xc0, 0x00, a, b, 0, 0, 0, 0, 0]
 }
 
 fn main() -> eframe::Result<()> {
@@ -777,8 +1360,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Xbox 360 Wheel Studio & FFB Feeder - Pro Edition")
-            .with_inner_size([1040.0, 740.0])
-            .with_min_inner_size([750.0, 540.0])
+            .with_inner_size([1100.0, 860.0])
+            .with_min_inner_size([900.0, 700.0])
             .with_resizable(true),
         ..Default::default()
     };
@@ -801,11 +1384,15 @@ struct DashboardApp {
     motor_on: bool,
     autocenter_val: u8,
     test_force: f32,
-    rumble_strong: u8,
-    rumble_weak: u8,
+    rumble_a: u8,
+    rumble_b: u8,
     ffb_gain: f32,
     invert_ffb: bool,
     ffb_debug: bool,
+    tune: Tuning,
+    rate_t: Instant,
+    rate_cnt: u32,
+    out_rate: u32,
     sweep_busy: Arc<AtomicBool>,
 }
 
@@ -818,11 +1405,15 @@ impl DashboardApp {
             motor_on: true,
             autocenter_val: 31,
             test_force: 0.0,
-            rumble_strong: 0,
-            rumble_weak: 0,
+            rumble_a: 0,
+            rumble_b: 0,
             ffb_gain: 1.0,
             invert_ffb: false,
             ffb_debug: true,
+            tune: Tuning::DEFAULT,
+            rate_t: Instant::now(),
+            rate_cnt: 0,
+            out_rate: 0,
             sweep_busy: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -843,12 +1434,20 @@ impl eframe::App for DashboardApp {
 
         let current = self.state.lock().unwrap().clone();
 
+        // معدل الإرسال الفعلي للدريكسيون (pkt/s)
+        if self.rate_t.elapsed() >= Duration::from_secs(1) {
+            let c = SENT_PKTS.load(Ordering::Relaxed);
+            self.out_rate = c.wrapping_sub(self.rate_cnt);
+            self.rate_cnt = c;
+            self.rate_t = Instant::now();
+        }
+
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
             // الجزء الأيسر
             ui.vertical(|ui| {
-                ui.set_width(710.0);
+                ui.set_width(730.0);
 
                 ui.horizontal(|ui| {
                     ui.heading(
@@ -947,7 +1546,7 @@ impl eframe::App for DashboardApp {
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("🎮 GAME LIVE FORCE FEEDBACK (DiRT 2 / FORZA)").color(Color32::from_rgb(0, 229, 255)).strong());
+                        ui.label(egui::RichText::new("🎮 GAME LIVE FORCE FEEDBACK").color(Color32::from_rgb(0, 229, 255)).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let motor_label = if self.motor_on { "MOTOR: ON" } else { "MOTOR: OFF" };
                             let motor_color = if self.motor_on { Color32::from_rgb(0, 230, 118) } else { Color32::GRAY };
@@ -961,22 +1560,69 @@ impl eframe::App for DashboardApp {
                     ui.add_space(4.0);
 
                     ui.horizontal(|ui| {
-                        ui.label("Live Game FFB Signal:");
+                        ui.label("Live Output:");
                         draw_ffb_meter(ui, current.game_ffb_force);
                         ui.label(format!("{:+4.0}%", current.game_ffb_force * 100.0));
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!("OUT {} pkt/s", self.out_rate))
+                                .color(Color32::GRAY)
+                                .monospace()
+                                .size(11.0),
+                        );
+                    });
+
+                    // الـ Effects اللي اللعبة استخدمتها فعلاً (أخضر = اللعبة بعتته)
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Game effects:").color(Color32::GRAY).size(11.0))
+                            .on_hover_text("لو SINE/SQUARE/TRIANGLE فاضلين رمادي وانت بتعدي على مطبات: يبقى اللعبة مش بتبعتهم -> افتح vJoyConf وفعّل كل الـ Effects");
+                        let names: [(u32, &str); 11] = [
+                            (ET_CONST, "CONST"),
+                            (ET_RAMP, "RAMP"),
+                            (ET_SQR, "SQUARE"),
+                            (ET_SINE, "SINE"),
+                            (ET_TRNGL, "TRIANGLE"),
+                            (ET_STUP, "SAW+"),
+                            (ET_STDN, "SAW-"),
+                            (ET_SPRNG, "SPRING"),
+                            (ET_DMPR, "DAMPER"),
+                            (ET_FRCTN, "FRICTION"),
+                            (ET_INRT, "INERTIA"),
+                        ];
+                        for (t, nm) in names {
+                            let seen = EFFECT_SEEN[t as usize].load(Ordering::Relaxed) > 0;
+                            let c = if seen { Color32::from_rgb(0, 230, 118) } else { Color32::from_rgb(90, 95, 105) };
+                            ui.label(egui::RichText::new(nm).color(c).monospace().size(11.0).strong());
+                        }
                     });
 
                     ui.add_space(4.0);
 
                     ui.horizontal(|ui| {
-                        ui.label("FFB Multiplier:");
-                        if ui.add(egui::Slider::new(&mut self.ffb_gain, 0.0..=2.0).text("Strength")).changed() {
+                        if ui.add(egui::Slider::new(&mut self.ffb_gain, 0.0..=2.0).text("Master Strength")).changed() {
                             let _ = self.tx.send(FfbCommand::Gain(self.ffb_gain));
                         }
                         ui.add_space(8.0);
                         if ui.checkbox(&mut self.invert_ffb, "Invert Direction").changed() {
                             let _ = self.tx.send(FfbCommand::Invert(self.invert_ffb));
                         }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(&mut self.tune.vib_gain, 0.0..=4.0).text("Bump / Vibration"))
+                            .on_hover_text("تكبير الاهتزاز (المطبات، الكيربات، الأرض الخشنة). ارفعه لو حاسس إن المطبات خفيفة");
+                        ui.add_space(8.0);
+                        ui.add(egui::Slider::new(&mut self.tune.detail, 0.0..=3.0).text("Impact Detail"))
+                            .on_hover_text("بيكبّر بداية الخبطات (نزلة من فوق مطب، صدمة). 0 = بدون");
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.tune.cond_on, "Spring / Damper / Friction")
+                            .on_hover_text("ثقل الدريكسيون ورجوعه للمنتصف زي ما اللعبة عايزة");
+                        ui.add_enabled(
+                            self.tune.cond_on,
+                            egui::Slider::new(&mut self.tune.cond_gain, 0.0..=1.5).text("Strength"),
+                        );
                     });
 
                     ui.horizontal(|ui| {
@@ -1002,6 +1648,48 @@ impl eframe::App for DashboardApp {
                             FFB_DEBUG.store(self.ffb_debug, Ordering::Relaxed);
                         }
                     });
+
+                    egui::CollapsingHeader::new("⚙ Advanced / Experimental")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Slider::new(&mut self.tune.send_ms, 4..=20).text("Min send interval").suffix(" ms"))
+                                    .on_hover_text("أقل فاصل بين باكتين للدريكسيون. قلله لو الدونجل يستحمل (شوف OUT pkt/s)، زوّده لو فيه أخطاء إرسال في اللوج");
+                            });
+
+                            ui.horizontal(|ui| {
+                                if ui.button("🧭 Detect Motor Direction")
+                                    .on_hover_text("سيب الدريكسيون بإيدك تماماً! هيدفعه ~0.3 ثانية ويقيس الاتجاه، عشان الـ Spring/Damper يشتغلوا صح")
+                                    .clicked()
+                                {
+                                    let _ = self.tx.send(FfbCommand::DetectPolarity);
+                                }
+                                let pol_txt = match current.polarity {
+                                    1 => "+force → +steering (detected)",
+                                    -1 => "+force → -steering (detected, auto-compensated)",
+                                    _ => "not tested (assuming +force → +steering)",
+                                };
+                                ui.label(egui::RichText::new(pol_txt).color(Color32::GRAY).size(11.0));
+                            });
+
+                            ui.separator();
+                            ui.label(egui::RichText::new("Rumble lab (لو الدريكسيون فيه موتورات اهتزاز)").color(Color32::GRAY).size(11.0));
+                            ui.horizontal(|ui| {
+                                let mut changed = false;
+                                changed |= ui.add(egui::Slider::new(&mut self.rumble_a, 0..=255).text("Motor A")).changed();
+                                changed |= ui.add(egui::Slider::new(&mut self.rumble_b, 0..=255).text("Motor B")).changed();
+                                if changed {
+                                    let _ = self.tx.send(FfbCommand::Rumble(self.rumble_a, self.rumble_b));
+                                }
+                                if ui.button("Stop").clicked() {
+                                    self.rumble_a = 0;
+                                    self.rumble_b = 0;
+                                    let _ = self.tx.send(FfbCommand::Rumble(0, 0));
+                                }
+                            });
+                            ui.checkbox(&mut self.tune.rumble_layer, "Drive rumble from game vibration (experimental)")
+                                .on_hover_text("بيبعت اهتزاز الأرض كمان كأوامر Rumble. جرّب الـ lab فوق الأول وشوف الدريكسيون بيستجيب ولا لأ");
+                        });
                 });
             });
 
@@ -1047,6 +1735,9 @@ impl eframe::App for DashboardApp {
                     });
             });
         });
+
+        // نبعت قيم الـ sliders للـ worker
+        *TUNE.lock().unwrap() = self.tune;
     }
 }
 
@@ -1197,6 +1888,25 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
     let mut sweep_force: i8 = 0;
     let mut shutting_down = false;
 
+    // --- حركة الدريكسيون (موقع + سرعة) للـ Spring / Damper / Friction ---
+    let mut cur_pos: f32 = 0.0;
+    let mut vel_ref_pos: f32 = 0.0;
+    let mut vel_f: f32 = 0.0;
+    let mut last_pos_t = Instant::now();
+    let mut last_lx: i16 = 0;
+
+    // --- اتجاه الموتور (+force بتلف ناحية +steering ولا العكس) ---
+    let mut phys_sign: f32 = 1.0;
+    let mut pol_test: Option<(Instant, i16)> = None;
+    let mut pol_decided = false;
+
+    // --- فلتر Impact Detail + Rumble layer ---
+    let mut detail_lp: f32 = 0.0;
+    let mut last_loop = Instant::now();
+    let mut last_rumble_b: u8 = 0;
+    let mut last_rumble_t = Instant::now();
+    let mut rumble_was_on = false;
+
     let mut last_buttons: u16 = 0;
     let mut last_throttle_active = false;
     let mut last_brake_active = false;
@@ -1267,8 +1977,8 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         // القوة اليدوية بتتبعت من نفس مسار الإرسال الموحد تحت
                         manual_force = force;
                     }
-                    FfbCommand::Rumble(strong, weak) => {
-                        let _ = send_pkt(&mut ep_out, &[0x00, 0x01, 0x0f, 0xc0, 0x00, weak, strong, 0, 0, 0, 0, 0]);
+                    FfbCommand::Rumble(a, b) => {
+                        let _ = send_pkt(&mut ep_out, &rumble_pkt(a, b));
                     }
                     FfbCommand::ResetPedals => {
                         let s = state.lock().unwrap();
@@ -1291,6 +2001,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         sweep_active = false;
                         sweep_force = 0;
                         manual_force = 0;
+                        pol_test = None;
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x04]); // motor on
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]); // start autocenter
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]); // full strength
@@ -1318,52 +2029,144 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x20]); // إعادة تشغيل السبرنج
                         let _ = send_pkt(&mut ep_out, &[0x00, 0x00, 0x0b, 0x7f]);
                     }
+                    // فحص اتجاه الموتور: دفعة قصيرة وقياس الحركة، وبعدين دفعة عكسية للرجوع
+                    FfbCommand::DetectPolarity => {
+                        if sweep_active || pol_test.is_some() {
+                            add_log("Motor direction test: busy, try again in a moment", Color32::from_rgb(255, 171, 0));
+                        } else {
+                            manual_force = 0;
+                            pol_test = Some((Instant::now(), last_lx));
+                            pol_decided = false;
+                            add_log(">>> Motor direction test: keep your hands OFF the wheel", Color32::YELLOW);
+                        }
+                    }
                     // قفل البرنامج: لازم نفك القوة المستمرة عن الدريكسيون
                     FfbCommand::Shutdown => {
                         shutting_down = true;
                         sweep_active = false;
                         manual_force = 0;
+                        pol_test = None;
                         for _ in 0..3 {
                             let _ = send_pkt(&mut ep_out, &force_pkt(0));
                         }
+                        let _ = send_pkt(&mut ep_out, &rumble_pkt(0, 0));
                         last_sent_ffb = 0;
                         add_log("Shutdown: wheel force released", Color32::from_rgb(0, 230, 118));
                     }
                 }
             }
 
-            // ===== حساب القوة المطلوبة (مصدر واحد: Shutdown > Sweep > اللعبة > Manual) =====
-            let game_force = if sweep_active || shutting_down { None } else { ffb_total_force() };
-            let target_byte: i8 = if shutting_down {
-                0
-            } else if sweep_active {
-                sweep_force
-            } else if let Some(f) = game_force {
-                let sign = if user_invert { 1.0 } else { -1.0 };
-                let f_norm = f * sign;
-                state.lock().unwrap().game_ffb_force = f_norm;
-                ((f_norm * user_gain).clamp(-1.0, 1.0) * 127.0) as i8
-            } else {
-                state.lock().unwrap().game_ffb_force = 0.0;
-                manual_force
+            let tune = *TUNE.lock().unwrap();
+            let loop_dt = last_loop.elapsed().as_secs_f32().clamp(0.0005, 0.05);
+            last_loop = Instant::now();
+
+            // ===== فحص اتجاه الموتور (لو شغال بيسيطر على القوة) =====
+            let pol_force: Option<i8> = match pol_test {
+                Some((t0, lx0)) => {
+                    let el = t0.elapsed();
+                    if el < Duration::from_millis(320) {
+                        Some(70)
+                    } else {
+                        if !pol_decided {
+                            pol_decided = true;
+                            let d = last_lx as i32 - lx0 as i32;
+                            if d > 1500 {
+                                phys_sign = 1.0;
+                                state.lock().unwrap().polarity = 1;
+                                add_log("Motor direction: +force turns wheel toward +steering (normal)", Color32::from_rgb(0, 230, 118));
+                            } else if d < -1500 {
+                                phys_sign = -1.0;
+                                state.lock().unwrap().polarity = -1;
+                                add_log("Motor direction: +force turns wheel toward -steering (reversed) -> auto-compensated", Color32::from_rgb(0, 230, 118));
+                            } else {
+                                add_log(
+                                    format!("Motor direction test inconclusive (moved {}). Release the wheel & check Motor is ON", d),
+                                    Color32::from_rgb(255, 171, 0),
+                                );
+                            }
+                        }
+                        if el < Duration::from_millis(640) {
+                            Some(-70)
+                        } else {
+                            pol_test = None;
+                            Some(0)
+                        }
+                    }
+                }
+                None => None,
             };
 
-            // ===== الإرسال: بنحدّث last_sent بس لو الإرسال نجح + تحديث دوري (keep-alive) =====
-            // السبب: القوة عند الدريكسيون مستمرة للأبد، فلو باكت "رجّع للصفر" ضاع على الدونجل
-            // اللاسلكي كان الدريكسيون يفضل مشدود لحد ما القوة تتغير.
-            if motor_inited {
-                let since = last_ffb_time.elapsed();
-                let refresh = if target_byte != 0 { Duration::from_millis(200) } else { Duration::from_millis(1000) };
-                let diff = (target_byte as i16 - last_sent_ffb as i16).abs();
-                let changed = diff >= 2 || (target_byte == 0 && last_sent_ffb != 0);
+            // ===== حساب القوة المطلوبة (Shutdown > Test > Sweep > اللعبة + Manual) =====
+            let vel_eff = if last_pos_t.elapsed() > Duration::from_millis(80) { 0.0 } else { vel_f };
+            let rp = RenderParams {
+                pos: cur_pos,
+                vel: vel_eff,
+                vib_gain: tune.vib_gain,
+                cond_on: tune.cond_on,
+                cond_gain: tune.cond_gain,
+            };
+            let mix = if sweep_active || shutting_down || pol_force.is_some() { None } else { ffb_render(&rp) };
 
-                if (changed && since >= Duration::from_millis(15)) || since >= refresh {
+            let mut vib_level: f32 = 0.0;
+            let target_byte: i8 = if shutting_down {
+                0
+            } else if let Some(b) = pol_force {
+                b
+            } else if sweep_active {
+                sweep_force
+            } else {
+                let sign = if user_invert { 1.0 } else { -1.0 };
+                let (di, phys, vib) = mix.map_or((0.0, 0.0, 0.0), |m| (m.di, m.phys, m.vib));
+                vib_level = vib;
+
+                // Impact Detail: بنكبّر بس "بداية" الخبطة (لما القوة بتزيد بنفس الاتجاه)، من غير ارتداد عند الإفلات
+                let a = 1.0 - (-loop_dt / 0.06).exp();
+                detail_lp += a * (di - detail_lp);
+                let hp = di - detail_lp;
+                let hp_onset = if hp * di > 0.0 { hp } else { 0.0 };
+                let di_boosted = di + tune.detail * hp_onset;
+
+                let game = (di_boosted * sign + phys * phys_sign) * user_gain;
+                state.lock().unwrap().game_ffb_force = game.clamp(-1.0, 1.0);
+
+                let total = game + manual_force as f32 / 127.0;
+                (total.clamp(-1.0, 1.0) * 127.0).round() as i8
+            };
+
+            if motor_inited {
+                // ===== طبقة الـ Rumble التجريبية =====
+                if tune.rumble_layer {
+                    if last_rumble_t.elapsed() >= Duration::from_millis(30) {
+                        let b = ((vib_level * tune.vib_gain).clamp(0.0, 1.0) * 255.0) as u8;
+                        if b.abs_diff(last_rumble_b) >= 6 || ((b == 0) != (last_rumble_b == 0)) {
+                            let _ = send_pkt(&mut ep_out, &rumble_pkt(b, b));
+                            last_rumble_b = b;
+                        }
+                        last_rumble_t = Instant::now();
+                    }
+                    rumble_was_on = true;
+                } else if rumble_was_on {
+                    let _ = send_pkt(&mut ep_out, &rumble_pkt(0, 0));
+                    last_rumble_b = 0;
+                    rumble_was_on = false;
+                }
+
+                // ===== الإرسال: بنحدّث last_sent بس لو الإرسال نجح + تحديث دوري (keep-alive) =====
+                // السبب: القوة عند الدريكسيون مستمرة للأبد، فلو باكت "رجّع للصفر" ضاع على الدونجل
+                // اللاسلكي كان الدريكسيون يفضل مشدود لحد ما القوة تتغير.
+                let since = last_ffb_time.elapsed();
+                let min_gap = Duration::from_millis(tune.send_ms.max(2) as u64);
+                let refresh = if target_byte != 0 { Duration::from_millis(200) } else { Duration::from_millis(1000) };
+                let changed = target_byte != last_sent_ffb;
+
+                if (changed && since >= min_gap) || since >= refresh {
                     let res = send_pkt(&mut ep_out, &force_pkt(target_byte));
                     last_ffb_time = Instant::now();
                     match res {
                         Ok(()) => {
                             last_sent_ffb = target_byte;
                             send_fail_count = 0;
+                            SENT_PKTS.fetch_add(1, Ordering::Relaxed);
                             if FFB_DEBUG.load(Ordering::Relaxed)
                                 && last_out_log.elapsed() >= Duration::from_millis(250)
                                 && (target_byte as i16 - last_out_byte as i16).abs() >= 8
@@ -1371,9 +2174,11 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                                 let steer = state.lock().unwrap().steering;
                                 add_log(
                                     format!(
-                                        "FFB OUT: byte={:+4} (game={:+.2}) steer={:+.0}%",
+                                        "FFB OUT: byte={:+4} (di={:+.2} cond={:+.2} vib={:.2}) steer={:+.0}%",
                                         target_byte,
-                                        game_force.unwrap_or(0.0),
+                                        mix.map_or(0.0, |m| m.di),
+                                        mix.map_or(0.0, |m| m.phys),
+                                        vib_level,
                                         steer as f32 / 327.68
                                     ),
                                     COL_DBG,
@@ -1395,7 +2200,7 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                 }
             }
 
-            if let Some(transfer) = ep_in.wait_next_complete(Duration::from_millis(8)) {
+            if let Some(transfer) = ep_in.wait_next_complete(Duration::from_millis(4)) {
                 if let Ok(()) = transfer.status {
                     let data = &transfer.buffer[..transfer.actual_len];
                     if data.starts_with(&[0x08, 0x00]) {
@@ -1408,6 +2213,21 @@ fn usb_and_vjoy_worker(state: Arc<Mutex<WheelState>>, rx_cmd: Receiver<FfbComman
                         let lt = data[8];
                         let rt = data[9];
                         let lx = i16::from_le_bytes([data[10], data[11]]);
+
+                        // موقع + سرعة الدريكسيون (بيستخدمهم الـ Spring / Damper / Friction)
+                        {
+                            let now = Instant::now();
+                            let new_pos = lx as f32 / 32768.0;
+                            let dt = now.duration_since(last_pos_t).as_secs_f32();
+                            if dt >= 0.002 {
+                                let raw_v = ((new_pos - vel_ref_pos) / dt).clamp(-12.0, 12.0);
+                                vel_f += 0.35 * (raw_v - vel_f);
+                                vel_ref_pos = new_pos;
+                                last_pos_t = now;
+                            }
+                            cur_pos = new_pos;
+                            last_lx = lx;
+                        }
 
                         let b_pct = brake_calib.process(lt, true);
                         let t_pct = throttle_calib.process(rt, true);
